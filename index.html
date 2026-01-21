@@ -33,13 +33,13 @@
 </head>
 <body>
     <div class="container">
-        <h1>🎙️ AI 語音轉錄 + 翻譯 (Pro版)</h1>
+        <h1>AI 語音轉錄 + 翻譯 (Pro版)</h1>
         <p style="color: #6b7280;">支援長錄音、斷點續傳、背景執行。上傳後可關閉視窗，稍後回來查看結果。</p>
 
         <div class="upload-area">
             <input type="file" id="fileInput" onchange="handleFileSelect(this)">
             <div id="uploadText">
-                <div style="font-size: 2rem; margin-bottom: 1rem;">☁️</div>
+                <div style="font-size: 2rem; margin-bottom: 1rem; color: var(--primary);">+</div>
                 <div>點擊或拖曳檔案至此</div>
                 <div id="selectedFileName" style="color: var(--primary); margin-top: 0.5rem; font-weight: 600;"></div>
             </div>
@@ -48,7 +48,7 @@
         <div id="uploadProgress" style="margin-top: 1rem; color: #6b7280;"></div>
 
         <div class="history-section">
-            <h2>📜 處理紀錄</h2>
+            <h2>處理紀錄</h2>
             <button onclick="clearHistory()" style="float: right; font-size: 0.8rem; background: none; border: none; color: #ef4444; cursor: pointer;">清除紀錄</button>
             <table class="history-table">
                 <thead>
@@ -189,7 +189,7 @@
                     <td>${statusBadge} <div id="status-${item.id}" style="font-size: 0.7rem; color: #888;"></div></td>
                     <td>
                         ${actionBtn}
-                        <button onclick="deleteHistoryItem('${item.id}')" style="margin-left: 0.5rem; border:none; background:none; cursor:pointer;">🗑️</button>
+                        <button onclick="deleteHistoryItem('${item.id}')" style="margin-left: 0.5rem; border:none; background:none; cursor:pointer; color: #991b1b;">刪除</button>
                     </td>
                 `;
                 list.appendChild(tr);

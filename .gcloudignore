@@ -1,0 +1,13 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+venv/
+.env
+.DS_Store
+# 忽略子服務資料夾，避免混淆或上傳過大
+gpu-worker/
+# 忽略本地測試檔案
+*.json
+*.mp3
+*.txt
