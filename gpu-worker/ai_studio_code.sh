@@ -1,0 +1,13 @@
+gcloud run deploy gpu-whisper-worker \
+  --source . \
+  --region us-central1 \
+  --no-allow-unauthenticated \
+  --gpu 1 \
+  --gpu-type nvidia-l4 \
+  --memory 16Gi \
+  --cpu 4 \
+  --concurrency 1 \
+  --timeout 3600 \
+  --min-instances 0 \
+  --max-instances 3 \
+  --clear-base-image

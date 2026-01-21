@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.env
+venv/
+.DS_Store
+.idea/
+.vscode/
+gpu-worker/model/
+raw_audio/
+transcripts/
+final_results/
+*.json
+*.mp3
+*.txt

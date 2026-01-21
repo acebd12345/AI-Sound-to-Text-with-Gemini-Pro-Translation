@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <title>AI 極速轉錄 (Pro版)</title>
+    <style>
+        body { font-family: sans-serif; padding: 50px; text-align: center; }
+        #log { margin-top: 20px; color: #666; white-space: pre-wrap;}
+        .btn { padding: 10px 20px; font-size: 16px; cursor: pointer; }
+        .success { background-color: #28a745; color: white; border: none; display: none; }
+    </style>
+</head>
+<body>
+    <h1>音檔轉錄 + Gemini Pro 翻譯</h1>
+    <input type="file" id="fileInput" />
+    <button onclick="startUpload()" class="btn">開始處理</button>
+    
+    <div id="log">等待操作...</div>
+    <button id="downloadBtn" class="btn success">下載繁中逐字稿</button>
+
+    <script>
+        const API_URL = ""; // 自動使用當前網域
+        const CHUNK_SIZE = 25 * 1024 * 1024;
+
+        async function startUpload() {
+            const file = document.getElementById('fileInput').files[0];
+            if (!file) return alert("選檔案！");
+
+            const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+            const fileId = `${Date.now()}_${file.name.replace(/\s/g, '')}`;
+            const log = document.getElementById('log');
+            
+            // 1. 分片上傳
+            for (let i = 0; i < totalChunks; i++) {
+                log.innerText = `正在上傳第 ${i+1}/${totalChunks} 片段...`;
+                const chunk = file.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+                const fd = new FormData();
+                fd.append("file_chunk", chunk);
+                fd.append("chunk_index", i);
+                fd.append("total_chunks", totalChunks);
+                fd.append("file_id", fileId);
+                
+                await fetch(`${API_URL}/upload_chunk`, { method: "POST", body: fd });
+            }
+
+            log.innerText = "上傳完成！後端正在 GPU 轉錄 + Gemini Pro 翻譯中...\n(請勿關閉視窗，這可能需要幾分鐘)";
+
+            // 2. 開始輪詢 (Polling)
+            const interval = setInterval(async () => {
+                try {
+                    const res = await fetch(`${API_URL}/check_status/${fileId}?total_chunks=${totalChunks}`);
+                    const data = await res.json();
+
+                    if (data.status === "processing") {
+                        log.innerText = `處理中... ${data.progress || ''}`;
+                    } else if (data.status === "completed") {
+                        clearInterval(interval);
+                        log.innerText = "完成！請下載。";
+                        
+                        // 設定下載按鈕
+                        const blob = new Blob([data.text], { type: "text/plain" });
+                        const url = URL.createObjectURL(blob);
+                        const btn = document.getElementById('downloadBtn');
+                        btn.style.display = "inline-block";
+                        btn.onclick = () => {
+                            const a = document.createElement('a');
+                            a.href = url;
+                            a.download = `${file.name}_TW_Translated.txt`;
+                            a.click();
+                        };
+                    }
+                } catch (e) {
+                    console.error("輪詢錯誤", e);
+                }
+            }, 5000); // 每 5 秒檢查一次
+        }
+    </script>
+</body>
+</html>
