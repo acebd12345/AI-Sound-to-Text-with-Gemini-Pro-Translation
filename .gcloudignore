@@ -11,3 +11,5 @@ gpu-worker/
 *.json
 *.mp3
 *.txt
+!requirements.txt
+!Dockerfile
