@@ -72,12 +72,18 @@ async def handle_event(request: Request):
         # 3. 執行 GPU 轉錄
         # beam_size=1 最快；beam_size=5 較準。這裡用 1 追求極速
         # 加入 VAD 過濾靜音區段，避免幻覺 (重複輸出)
+        # language="zh": 強制中文，避免亂跳語言
+        # condition_on_previous_text=False: 避免重複上一句 (鬼打牆)
+        # word_timestamps=True: 提高時間軸精準度
         segments, info = model.transcribe(
             local_input_path,
             beam_size=5,
             vad_filter=True,
             vad_parameters=dict(min_silence_duration_ms=500),
-            initial_prompt="以下是繁體中文的字幕。"
+            initial_prompt="以下是繁體中文的字幕。",
+            language="zh",
+            condition_on_previous_text=False,
+            word_timestamps=True
         )
 
         # 4. 整理結果
