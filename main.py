@@ -154,21 +154,26 @@ async def check_status(file_id: str, total_chunks: int):
             chunk_srt_lines.append(f"{current_srt_index}\n{start} --> {end}\n{text}")
             current_srt_index += 1
             
-        chunk_srt_content = "\n\n".join(chunk_srt_lines)
+        # 分批翻譯 (避免一次送太多給 Gemini 導致失敗)
+        BATCH_SIZE = 50  # 每次處理 50 句字幕
+        chunk_trans_text = ""
         
-        # 翻譯 (傳入 SRT 格式)
-        if chunk_srt_content.strip():
-            trans_text = translate_segment_pro(chunk_srt_content, i)
-        else:
-            trans_text = ""
-
-        full_translated_text += trans_text + "\n\n"
+        if chunk_srt_lines:
+            for k in range(0, len(chunk_srt_lines), BATCH_SIZE):
+                batch_lines = chunk_srt_lines[k:k+BATCH_SIZE]
+                batch_content = "\n\n".join(batch_lines)
+                
+                print(f"正在翻譯第 {i+1} 區塊的第 {k//BATCH_SIZE + 1} 批次 ({len(batch_lines)} 句)...")
+                batch_res = translate_segment_pro(batch_content, f"{i}_{k}")
+                chunk_trans_text += batch_res + "\n\n"
+                
+                # 批次間稍微休息，避免 Rate Limit
+                time.sleep(1)
+        
+        full_translated_text += chunk_trans_text
         
         # 更新時間偏移
         current_time_offset += chunk_duration
-        
-        # 避免 Pro 速率限制
-        time.sleep(1)
 
     # 4. 存檔並回傳
     final_blob.upload_from_string(full_translated_text)

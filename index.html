@@ -2,77 +2,244 @@
 <html lang="zh-TW">
 <head>
     <meta charset="UTF-8">
-    <title>AI 極速轉錄 (Pro版)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 智能轉錄翻譯 (Pro)</title>
     <style>
-        body { font-family: sans-serif; padding: 50px; text-align: center; }
-        #log { margin-top: 20px; color: #666; white-space: pre-wrap;}
-        .btn { padding: 10px 20px; font-size: 16px; cursor: pointer; }
-        .success { background-color: #28a745; color: white; border: none; display: none; }
+        :root { --primary: #4f46e5; --success: #10b981; --bg: #f3f4f6; }
+        body { margin: 0; font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: #1f2937; padding: 20px; }
+        .container { max-width: 800px; margin: 0 auto; background: white; padding: 2rem; border-radius: 1rem; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }
+        h1 { margin-top: 0; color: #111827; }
+        
+        /* Upload Section */
+        .upload-area { border: 2px dashed #e5e7eb; padding: 3rem; text-align: center; border-radius: 0.75rem; cursor: pointer; transition: 0.2s; position: relative; }
+        .upload-area:hover { border-color: var(--primary); background: #f9fafb; }
+        input[type="file"] { position: absolute; top: 0; left: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; }
+        
+        .btn { background: var(--primary); color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 0.5rem; font-weight: 600; cursor: pointer; transition: 0.2s; display: inline-block; margin-top: 1rem; }
+        .btn:hover { opacity: 0.9; }
+        .btn:disabled { background: #9ca3af; cursor: not-allowed; }
+        .btn.download { background: var(--success); text-decoration: none; font-size: 0.875rem; padding: 0.5rem 1rem; }
+
+        /* History Section */
+        .history-section { margin-top: 3rem; border-top: 1px solid #e5e7eb; padding-top: 2rem; }
+        .history-table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
+        .history-table th, .history-table td { text-align: left; padding: 1rem; border-bottom: 1px solid #f3f4f6; }
+        .history-table th { color: #6b7280; font-weight: 600; font-size: 0.875rem; }
+        .status-badge { display: inline-block; padding: 0.25rem 0.75rem; border-radius: 999px; font-size: 0.75rem; font-weight: 600; }
+        .status-processing { background: #e0e7ff; color: #4338ca; }
+        .status-completed { background: #d1fae5; color: #065f46; }
+        .status-error { background: #fee2e2; color: #991b1b; }
     </style>
 </head>
 <body>
-    <h1>音檔轉錄 + Gemini Pro 翻譯</h1>
-    <input type="file" id="fileInput" />
-    <button onclick="startUpload()" class="btn">開始處理</button>
-    
-    <div id="log">等待操作...</div>
-    <button id="downloadBtn" class="btn success">下載繁中逐字稿</button>
+    <div class="container">
+        <h1>🎙️ AI 語音轉錄 + 翻譯 (Pro版)</h1>
+        <p style="color: #6b7280;">支援長錄音、斷點續傳、背景執行。上傳後可關閉視窗，稍後回來查看結果。</p>
+
+        <div class="upload-area">
+            <input type="file" id="fileInput" onchange="handleFileSelect(this)">
+            <div id="uploadText">
+                <div style="font-size: 2rem; margin-bottom: 1rem;">☁️</div>
+                <div>點擊或拖曳檔案至此</div>
+                <div id="selectedFileName" style="color: var(--primary); margin-top: 0.5rem; font-weight: 600;"></div>
+            </div>
+        </div>
+        <button id="startBtn" onclick="startUpload()" class="btn" style="width: 100%; display: none;">開始上傳與處理</button>
+        <div id="uploadProgress" style="margin-top: 1rem; color: #6b7280;"></div>
+
+        <div class="history-section">
+            <h2>📜 處理紀錄</h2>
+            <button onclick="clearHistory()" style="float: right; font-size: 0.8rem; background: none; border: none; color: #ef4444; cursor: pointer;">清除紀錄</button>
+            <table class="history-table">
+                <thead>
+                    <tr>
+                        <th>檔案名稱</th>
+                        <th>提交時間</th>
+                        <th>狀態</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody id="historyList"></tbody>
+            </table>
+        </div>
+    </div>
 
     <script>
-        const API_URL = ""; // 自動使用當前網域
-        const CHUNK_SIZE = 25 * 1024 * 1024;
+        const API_URL = ""; 
+        const CHUNK_SIZE = 25 * 1024 * 1024; 
+        
+        // 初始化載入紀錄
+        document.addEventListener('DOMContentLoaded', loadHistory);
+
+        function handleFileSelect(input) {
+            if (input.files[0]) {
+                document.getElementById('selectedFileName').innerText = input.files[0].name;
+                document.getElementById('startBtn').style.display = 'inline-block';
+            }
+        }
 
         async function startUpload() {
             const file = document.getElementById('fileInput').files[0];
-            if (!file) return alert("選檔案！");
+            if (!file) return;
 
-            const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+            const btn = document.getElementById('startBtn');
+            btn.disabled = true;
+            btn.innerText = "上傳中...";
+
             const fileId = `${Date.now()}_${file.name.replace(/\s/g, '')}`;
-            const log = document.getElementById('log');
-            
-            // 1. 分片上傳
-            for (let i = 0; i < totalChunks; i++) {
-                log.innerText = `正在上傳第 ${i+1}/${totalChunks} 片段...`;
-                const chunk = file.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
-                const fd = new FormData();
-                fd.append("file_chunk", chunk);
-                fd.append("chunk_index", i);
-                fd.append("total_chunks", totalChunks);
-                fd.append("file_id", fileId);
-                
-                await fetch(`${API_URL}/upload_chunk`, { method: "POST", body: fd });
-            }
+            const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
 
-            log.innerText = "上傳完成！後端正在 GPU 轉錄 + Gemini Pro 翻譯中...\n(請勿關閉視窗，這可能需要幾分鐘)";
+            // 加入紀錄
+            addHistoryItem(fileId, file.name, totalChunks);
 
-            // 2. 開始輪詢 (Polling)
-            const interval = setInterval(async () => {
-                try {
-                    const res = await fetch(`${API_URL}/check_status/${fileId}?total_chunks=${totalChunks}`);
-                    const data = await res.json();
-
-                    if (data.status === "processing") {
-                        log.innerText = `處理中... ${data.progress || ''}`;
-                    } else if (data.status === "completed") {
-                        clearInterval(interval);
-                        log.innerText = "完成！請下載。";
-                        
-                        // 設定下載按鈕
-                        const blob = new Blob([data.text], { type: "text/plain" });
-                        const url = URL.createObjectURL(blob);
-                        const btn = document.getElementById('downloadBtn');
-                        btn.style.display = "inline-block";
-                        btn.onclick = () => {
-                            const a = document.createElement('a');
-                            a.href = url;
-                            a.download = `${file.name}_TW_Translated.txt`;
-                            a.click();
-                        };
-                    }
-                } catch (e) {
-                    console.error("輪詢錯誤", e);
+            try {
+                for (let i = 0; i < totalChunks; i++) {
+                    document.getElementById('uploadProgress').innerText = `正在上傳第 ${i+1}/${totalChunks} 部分...`;
+                    const chunk = file.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+                    const fd = new FormData();
+                    fd.append("file_chunk", chunk);
+                    fd.append("chunk_index", i);
+                    fd.append("total_chunks", totalChunks);
+                    fd.append("file_id", fileId);
+                    
+                    await fetch(`${API_URL}/upload_chunk`, { method: "POST", body: fd });
                 }
-            }, 5000); // 每 5 秒檢查一次
+                
+                document.getElementById('uploadProgress').innerText = "上傳完成！已加入背景處理佇列。";
+                btn.innerText = "開始上傳與處理";
+                btn.disabled = false;
+                
+                // 開始輪詢 (觸發一次狀態檢查)
+                checkTaskStatus(fileId, totalChunks);
+
+            } catch (e) {
+                console.error(e);
+                alert("上傳失敗");
+                btn.disabled = false;
+            }
+        }
+
+        // --- History & Polling Logic ---
+
+        function getHistory() {
+            return JSON.parse(localStorage.getItem('stt_history') || '[]');
+        }
+
+        function saveHistory(history) {
+            localStorage.setItem('stt_history', JSON.stringify(history));
+            renderHistory();
+        }
+
+        function addHistoryItem(id, name, chunks) {
+            const history = getHistory();
+            history.unshift({
+                id: id,
+                name: name,
+                chunks: chunks,
+                date: new Date().toLocaleString(),
+                status: 'processing', // processing, completed
+                text: null
+            });
+            saveHistory(history);
+            checkTaskStatus(id, chunks); // Start polling this new task
+        }
+
+        function updateHistoryItem(id, updates) {
+            const history = getHistory();
+            const index = history.findIndex(h => h.id === id);
+            if (index !== -1) {
+                history[index] = { ...history[index], ...updates };
+                saveHistory(history);
+            }
+        }
+
+        function deleteHistoryItem(id) {
+            const history = getHistory();
+            const newHistory = history.filter(h => h.id !== id);
+            saveHistory(newHistory);
+        }
+        
+        function clearHistory() {
+            if(confirm('確定清空所有紀錄？')) {
+                localStorage.removeItem('stt_history');
+                renderHistory();
+            }
+        }
+
+        function renderHistory() {
+            const list = document.getElementById('historyList');
+            const history = getHistory();
+            list.innerHTML = '';
+
+            history.forEach(item => {
+                const tr = document.createElement('tr');
+                let statusBadge = `<span class="status-badge status-processing">處理中...</span>`;
+                let actionBtn = '';
+
+                if (item.status === 'completed') {
+                    statusBadge = `<span class="status-badge status-completed">完成</span>`;
+                    actionBtn = `<button class="btn download" onclick="downloadResult('${item.id}')">下載 SRT</button>`;
+                } else if (item.status === 'error') {
+                    statusBadge = `<span class="status-badge status-error">失敗</span>`;
+                }
+
+                tr.innerHTML = `
+                    <td>${item.name}</td>
+                    <td style="font-size: 0.8rem; color: #666;">${item.date}</td>
+                    <td>${statusBadge} <div id="status-${item.id}" style="font-size: 0.7rem; color: #888;"></div></td>
+                    <td>
+                        ${actionBtn}
+                        <button onclick="deleteHistoryItem('${item.id}')" style="margin-left: 0.5rem; border:none; background:none; cursor:pointer;">🗑️</button>
+                    </td>
+                `;
+                list.appendChild(tr);
+            });
+        }
+
+        async function checkTaskStatus(fileId, totalChunks) {
+            const statusDiv = document.getElementById(`status-${fileId}`);
+            
+            try {
+                const res = await fetch(`${API_URL}/check_status/${fileId}?total_chunks=${totalChunks}`);
+                const data = await res.json();
+
+                if (data.status === "completed") {
+                    updateHistoryItem(fileId, { status: 'completed', text: data.text });
+                } else {
+                    // Update progress text
+                    if (statusDiv) statusDiv.innerText = data.progress || '';
+                    // Poll again in 5 seconds
+                    setTimeout(() => checkTaskStatus(fileId, totalChunks), 5000);
+                }
+            } catch (e) {
+                console.error("Polling error", e);
+                // Don't stop polling on transient network errors, retry
+                setTimeout(() => checkTaskStatus(fileId, totalChunks), 10000);
+            }
+        }
+
+        function downloadResult(id) {
+            const history = getHistory();
+            const item = history.find(h => h.id === id);
+            if (item && item.text) {
+                const blob = new Blob([item.text], { type: "text/plain" });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `${item.name}.srt`;
+                a.click();
+            }
+        }
+
+        function loadHistory() {
+            renderHistory();
+            // Restart polling for incomplete tasks
+            const history = getHistory();
+            history.forEach(item => {
+                if (item.status === 'processing') {
+                    checkTaskStatus(item.id, item.chunks);
+                }
+            });
         }
     </script>
 </body>
