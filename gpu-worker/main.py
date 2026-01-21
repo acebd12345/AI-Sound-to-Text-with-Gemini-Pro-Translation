@@ -69,21 +69,43 @@ async def handle_event(request: Request):
         blob = bucket.blob(file_name)
         blob.download_to_filename(local_input_path)
 
+        # 解析 file_id 以便讀取 metadata
+        path_parts = file_name.split('/')
+        file_id = path_parts[-2] if len(path_parts) >= 3 else "unknown"
+
+        # 預設參數 (Speech)
+        use_vad = True
+        temp = 0.2
+        prompt_text = "以下是繁體中文的字幕。"
+
+        # 讀取 Metadata 調整參數
+        try:
+            meta_blob = bucket.blob(f"raw_audio/{file_id}/metadata.json")
+            if meta_blob.exists():
+                meta = json.loads(meta_blob.download_as_text())
+                if meta.get("mode") == "song":
+                    print("🎵 模式偵測: 歌曲 (VAD=False, Temp=0)")
+                    use_vad = False
+                    temp = 0
+                    prompt_text = "以下是繁體中文的歌詞。"
+        except Exception as e:
+            print(f"Metadata 讀取失敗 (使用預設值): {e}")
+
         # 3. 執行 GPU 轉錄
         # beam_size=1 最快；beam_size=5 較準。這裡用 1 追求極速
-        # 加入 VAD 過濾靜音區段，避免幻覺 (重複輸出)
         # language="zh": 強制中文，避免亂跳語言
         # condition_on_previous_text=False: 避免重複上一句 (鬼打牆)
         # word_timestamps=True: 提高時間軸精準度
         segments, info = model.transcribe(
             local_input_path,
             beam_size=5,
-            vad_filter=True,
+            vad_filter=use_vad,
             vad_parameters=dict(min_silence_duration_ms=500),
-            initial_prompt="以下是繁體中文的字幕。",
+            initial_prompt=prompt_text,
             language="zh",
             condition_on_previous_text=False,
-            word_timestamps=True
+            word_timestamps=True,
+            temperature=temp
         )
 
         # 4. 整理結果

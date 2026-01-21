@@ -36,8 +36,17 @@
         <h1>AI 語音轉錄 + 翻譯 (Pro版)</h1>
         <p style="color: #6b7280;">支援長錄音、斷點續傳、背景執行。上傳後可關閉視窗，稍後回來查看結果。</p>
 
+        <!-- Mode Selection -->
+        <div style="margin-bottom: 1.5rem; text-align: left;">
+            <label style="font-weight: 600; color: #374151; display: block; margin-bottom: 0.5rem;">處理模式：</label>
+            <select id="processMode" style="width: 100%; padding: 0.75rem; border-radius: 0.5rem; border: 1px solid #d1d5db; background: white; font-size: 1rem;">
+                <option value="speech">🗣️ 一般對話 / 會議 (自動過濾靜音)</option>
+                <option value="song">🎵 歌曲 / 歌詞 (保留人聲細節)</option>
+            </select>
+        </div>
+
         <div class="upload-area">
-            <input type="file" id="fileInput" onchange="handleFileSelect(this)">
+            <input type="file" id="fileInput" onchange="handleFileSelect(this)" accept="audio/*,video/*,.mp3,.wav,.m4a,.mp4,.mov,.wma,.aac">
             <div id="uploadText">
                 <div style="font-size: 2rem; margin-bottom: 1rem; color: var(--primary);">+</div>
                 <div>點擊或拖曳檔案至此</div>
@@ -72,15 +81,28 @@
         document.addEventListener('DOMContentLoaded', loadHistory);
 
         function handleFileSelect(input) {
-            if (input.files[0]) {
-                document.getElementById('selectedFileName').innerText = input.files[0].name;
+            const file = input.files[0];
+            if (file) {
+                // 簡單的格式檢查
+                const validExtensions = ['.mp3', '.wav', '.m4a', '.mp4', '.mov', '.wma', '.aac', '.flac', '.ogg'];
+                const ext = file.name.substring(file.name.lastIndexOf('.')).toLowerCase();
+                
+                if (!file.type.startsWith('audio/') && !file.type.startsWith('video/') && !validExtensions.includes(ext)) {
+                    alert("不支援的檔案格式！請上傳音訊或影片檔。");
+                    input.value = ''; // 清空
+                    document.getElementById('selectedFileName').innerText = "";
+                    document.getElementById('startBtn').style.display = 'none';
+                    return;
+                }
+
+                document.getElementById('selectedFileName').innerText = file.name;
                 document.getElementById('startBtn').style.display = 'inline-block';
             }
         }
 
         async function startUpload() {
             const file = document.getElementById('fileInput').files[0];
-            if (!file) return;
+            if (!file) return alert("請先選擇檔案！");
 
             const btn = document.getElementById('startBtn');
             btn.disabled = true;
@@ -88,6 +110,7 @@
 
             const fileId = `${Date.now()}_${file.name.replace(/\s/g, '')}`;
             const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+            const mode = document.getElementById('processMode').value;
 
             // 加入紀錄
             addHistoryItem(fileId, file.name, totalChunks);
@@ -101,6 +124,7 @@
                     fd.append("chunk_index", i);
                     fd.append("total_chunks", totalChunks);
                     fd.append("file_id", fileId);
+                    fd.append("mode", mode); // 傳送模式參數
                     
                     await fetch(`${API_URL}/upload_chunk`, { method: "POST", body: fd });
                 }

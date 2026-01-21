@@ -16,8 +16,8 @@ app = FastAPI()
 # --- 設定區 ---
 # 請務必確認 GCP 服務帳號有權限，且 API KEY 正確
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-# 您指定要用 Pro (API 代號目前為 gemini-3.0-pro)
-MODEL_NAME = "gemini-3.0-pro"
+# 您指定要用 Pro (API 代號目前為 gemini-3-pro-preview)
+MODEL_NAME = "gemini-3-pro-preview"
 
 if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY not found in environment variables")
@@ -55,7 +55,7 @@ def format_timestamp(seconds: float) -> str:
 # --- Gemini 分段翻譯函式 ---
 def translate_segment_pro(srt_content, index):
     """使用 Gemini Pro 翻譯單一區塊 (SRT)"""
-    print(f"[Gemini Pro] 正在翻譯第 {index+1} 段 (SRT)...")
+    print(f"[Gemini Pro] 正在翻譯第 {index} 段 (SRT)...")
     model = genai.GenerativeModel(MODEL_NAME)
     
     prompt = f"""You are a professional subtitle translator and Traditional Chinese localization expert.
@@ -66,7 +66,8 @@ CRITICAL RULES:
 2. ONLY translate/rewrite the subtitle text lines.
 3. Output the result in standard SRT format.
 4. ENSURE ALL TEXT IS IN TRADITIONAL CHINESE (Taiwan). Convert any Simplified Chinese characters or foreign terms into standard Taiwan Traditional Chinese.
-5. Do not include any explanation or markdown formatting (like ```srt). Just the raw SRT content.
+5. DETECT HALLUCINATIONS: If a subtitle line appears to be an ASR hallucination (e.g., repetitive nonsense, "Subscribe", "Thanks for watching", or random characters unrelated to context), replace the text with "..." or leave it blank.
+6. Do not include any explanation or markdown formatting (like ```srt). Just the raw SRT content.
 
 {srt_content}"""
     
@@ -75,7 +76,7 @@ CRITICAL RULES:
         response = model.generate_content(prompt)
         return response.text.strip()
     except Exception as e:
-        print(f"第 {index+1} 段翻譯失敗: {e}")
+        print(f"第 {index} 段翻譯失敗: {e}")
         return srt_content # 失敗則回傳原文
 
 # --- 上傳接口 (保持不變) ---
@@ -84,10 +85,17 @@ async def upload_chunk(
     file_chunk: UploadFile,
     chunk_index: int = Form(...),
     total_chunks: int = Form(...),
-    file_id: str = Form(...)
+    file_id: str = Form(...),
+    mode: str = Form("speech")
 ):
     # 這裡我們直接上傳到 GCS 的 'raw_audio' 資料夾
     bucket = storage_client.bucket(BUCKET_NAME)
+    
+    # 如果是第一塊，順便儲存 metadata
+    if chunk_index == 0:
+        meta_blob = bucket.blob(f"raw_audio/{file_id}/metadata.json")
+        meta_blob.upload_from_string(json.dumps({"mode": mode}))
+
     blob = bucket.blob(f"raw_audio/{file_id}/{chunk_index}")
     blob.upload_from_file(file_chunk.file)
     
