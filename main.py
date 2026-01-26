@@ -52,13 +52,14 @@ def format_timestamp(seconds: float) -> str:
     millis = total_milli % 1000
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
-# --- Gemini 分段翻譯函式 ---
-def translate_segment_pro(srt_content, index):
+# --- Gemini 分段翻譯函式 (Async) ---
+async def translate_segment_pro(srt_content, index, semaphore):
     """使用 Gemini Pro 翻譯單一區塊 (SRT)"""
-    print(f"[Gemini Pro] 正在翻譯第 {index} 段 (SRT)...")
-    model = genai.GenerativeModel(MODEL_NAME)
-    
-    prompt = f"""You are a professional subtitle translator and Traditional Chinese localization expert.
+    async with semaphore:
+        print(f"[Gemini Pro] 正在翻譯第 {index} 段 (SRT)...")
+        model = genai.GenerativeModel(MODEL_NAME)
+        
+        prompt = f"""You are a professional subtitle translator and Traditional Chinese localization expert.
 Task: Translate and Convert the following SRT subtitle content into Traditional Chinese (Taiwan) (繁體中文).
 
 CRITICAL RULES:
@@ -70,14 +71,14 @@ CRITICAL RULES:
 6. Do not include any explanation or markdown formatting (like ```srt). Just the raw SRT content.
 
 {srt_content}"""
-    
-    try:
-        # Pro 模型比較慢，這裡設定 timeout 避免卡死
-        response = model.generate_content(prompt)
-        return response.text.strip()
-    except Exception as e:
-        print(f"第 {index} 段翻譯失敗: {e}")
-        return srt_content # 失敗則回傳原文
+        
+        try:
+            # 使用非同步生成
+            response = await model.generate_content_async(prompt)
+            return response.text.strip()
+        except Exception as e:
+            print(f"第 {index} 段翻譯失敗: {e}")
+            return srt_content # 失敗則回傳原文
 
 # --- 上傳接口 (保持不變) ---
 @app.post("/upload_chunk")
@@ -149,19 +150,30 @@ async def check_status(file_id: str, total_chunks: int, background_tasks: Backgr
 async def run_translation_background(file_id, total_chunks, bucket):
     try:
         print(f"[{file_id}] 開始後台翻譯...")
-        transcripts = []
-        for i in range(total_chunks):
-            blob = bucket.blob(f"transcripts/{file_id}_part_{i}.json")
-            transcripts.append(blob)
-
-        full_translated_text = ""
+        
+        # 1. 平行下載所有 Transcript (IO Bound)
+        print(f"[{file_id}] 正在下載所有轉錄檔...")
+        loop = asyncio.get_running_loop()
+        blob_names = [f"transcripts/{file_id}_part_{i}.json" for i in range(total_chunks)]
+        blobs = [bucket.blob(name) for name in blob_names]
+        
+        # 使用 run_in_executor 讓 blocking IO 不卡住 event loop
+        download_tasks = [loop.run_in_executor(None, blob.download_as_text) for blob in blobs]
+        results_json = await asyncio.gather(*download_tasks)
+        
+        # 2. 準備翻譯任務
+        print(f"[{file_id}] 準備翻譯任務...")
+        semaphore = asyncio.Semaphore(8) # 限制同時 8 個請求以免被 Rate Limit
+        translation_tasks = []
+        ordered_batches = [] # 用來存放順序資訊 (chunk_index, batch_index)
+        
         current_time_offset = 0.0
         current_srt_index = 1
+        BATCH_SIZE = 50
 
-        for i in range(total_chunks):
-            json_content = transcripts[i].download_as_text()
+        # 先預處理所有 SRT 文本
+        for i, json_content in enumerate(results_json):
             data = json.loads(json_content)
-            
             segments = data.get("segments", [])
             chunk_duration = data.get("duration", 0.0)
             
@@ -172,22 +184,31 @@ async def run_translation_background(file_id, total_chunks, bucket):
                 text = seg['text'].strip()
                 chunk_srt_lines.append(f"{current_srt_index}\n{start} --> {end}\n{text}")
                 current_srt_index += 1
-                
-            BATCH_SIZE = 50
-            chunk_trans_text = ""
             
+            current_time_offset += chunk_duration
+            
+            # 分批建立 Task
             if chunk_srt_lines:
                 for k in range(0, len(chunk_srt_lines), BATCH_SIZE):
                     batch_lines = chunk_srt_lines[k:k+BATCH_SIZE]
                     batch_content = "\n\n".join(batch_lines)
                     
-                    print(f"正在翻譯第 {i+1} 區塊的第 {k//BATCH_SIZE + 1} 批次...")
-                    batch_res = translate_segment_pro(batch_content, f"{i}_{k}")
-                    chunk_trans_text += batch_res + "\n\n"
-                    time.sleep(1)
+                    # 建立 Async Task
+                    task = translate_segment_pro(batch_content, f"{i}_{k}", semaphore)
+                    translation_tasks.append(task)
+                    ordered_batches.append((i, k)) # 紀錄順序
+
+        # 3. 平行執行翻譯 (Network Bound)
+        if translation_tasks:
+            print(f"[{file_id}] 啟動 {len(translation_tasks)} 個翻譯任務 (併發)...")
+            translated_results = await asyncio.gather(*translation_tasks)
             
-            full_translated_text += chunk_trans_text
-            current_time_offset += chunk_duration
+            # 4. 組合結果
+            full_translated_text = ""
+            for res in translated_results:
+                full_translated_text += res + "\n\n"
+        else:
+            full_translated_text = ""
 
         # 存檔
         final_blob = bucket.blob(f"final_results/{file_id}_TW_Complete.txt")
