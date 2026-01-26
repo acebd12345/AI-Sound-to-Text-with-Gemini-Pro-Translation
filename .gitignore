@@ -12,3 +12,4 @@ final_results/
 *.json
 *.mp3
 *.txt
+!requirements.txt

@@ -106,7 +106,7 @@ async def upload_chunk(
 
 # --- 核心：狀態檢查與自動合併接口 ---
 @app.get("/check_status/{file_id}")
-async def check_status(file_id: str, total_chunks: int):
+async def check_status(file_id: str, total_chunks: int, background_tasks: BackgroundTasks):
     bucket = storage_client.bucket(BUCKET_NAME)
     
     # 1. 檢查 GPU 轉錄是否全部完成
@@ -131,61 +131,74 @@ async def check_status(file_id: str, total_chunks: int):
     final_blob = bucket.blob(final_blob_path)
     
     if final_blob.exists():
-        # 如果已經翻譯過，直接回傳下載連結
-        # 這裡簡單回傳文字內容讓前端下載，或生成 Signed URL
         content = final_blob.download_as_text()
         return {"status": "completed", "text": content}
     
-    # 3. 尚未翻譯，開始執行 (這會花一點時間，FastAPI 適合用 BackgroundTask，但為了讓您馬上拿到，這裡同步執行)
-    # 若檔案很大，建議這裡改為 return "translating" 狀態，讓前端繼續輪詢
-    
-    print("所有轉錄片段到位，開始 Gemini Pro 翻譯流程...")
-    full_translated_text = ""
-    
-    current_time_offset = 0.0
-    current_srt_index = 1
+    # 3. 檢查是否正在翻譯中 (Lock)
+    lock_blob = bucket.blob(f"locks/{file_id}")
+    if lock_blob.exists():
+        return {"status": "processing", "progress": "AI 正在翻譯中 (請稍候)..."}
 
-    for i in range(total_chunks):
-        # 下載原文
-        json_content = transcripts[i].download_as_text()
-        data = json.loads(json_content)
-        
-        segments = data.get("segments", [])
-        chunk_duration = data.get("duration", 0.0)
-        
-        # 產生此區塊的 SRT (需加上時間偏移)
-        chunk_srt_lines = []
-        for seg in segments:
-            start = format_timestamp(seg['start'] + current_time_offset)
-            end = format_timestamp(seg['end'] + current_time_offset)
-            text = seg['text'].strip()
-            chunk_srt_lines.append(f"{current_srt_index}\n{start} --> {end}\n{text}")
-            current_srt_index += 1
+    # 4. 尚未翻譯，啟動後台任務
+    print("啟動後台翻譯任務...")
+    lock_blob.upload_from_string("locked") # 上鎖
+    background_tasks.add_task(run_translation_background, file_id, total_chunks, bucket)
+    
+    return {"status": "processing", "progress": "已排入翻譯佇列..."}
+
+async def run_translation_background(file_id, total_chunks, bucket):
+    try:
+        print(f"[{file_id}] 開始後台翻譯...")
+        transcripts = []
+        for i in range(total_chunks):
+            blob = bucket.blob(f"transcripts/{file_id}_part_{i}.json")
+            transcripts.append(blob)
+
+        full_translated_text = ""
+        current_time_offset = 0.0
+        current_srt_index = 1
+
+        for i in range(total_chunks):
+            json_content = transcripts[i].download_as_text()
+            data = json.loads(json_content)
             
-        # 分批翻譯 (避免一次送太多給 Gemini 導致失敗)
-        BATCH_SIZE = 50  # 每次處理 50 句字幕
-        chunk_trans_text = ""
-        
-        if chunk_srt_lines:
-            for k in range(0, len(chunk_srt_lines), BATCH_SIZE):
-                batch_lines = chunk_srt_lines[k:k+BATCH_SIZE]
-                batch_content = "\n\n".join(batch_lines)
+            segments = data.get("segments", [])
+            chunk_duration = data.get("duration", 0.0)
+            
+            chunk_srt_lines = []
+            for seg in segments:
+                start = format_timestamp(seg['start'] + current_time_offset)
+                end = format_timestamp(seg['end'] + current_time_offset)
+                text = seg['text'].strip()
+                chunk_srt_lines.append(f"{current_srt_index}\n{start} --> {end}\n{text}")
+                current_srt_index += 1
                 
-                print(f"正在翻譯第 {i+1} 區塊的第 {k//BATCH_SIZE + 1} 批次 ({len(batch_lines)} 句)...")
-                batch_res = translate_segment_pro(batch_content, f"{i}_{k}")
-                chunk_trans_text += batch_res + "\n\n"
-                
-                # 批次間稍微休息，避免 Rate Limit
-                time.sleep(1)
-        
-        full_translated_text += chunk_trans_text
-        
-        # 更新時間偏移
-        current_time_offset += chunk_duration
+            BATCH_SIZE = 50
+            chunk_trans_text = ""
+            
+            if chunk_srt_lines:
+                for k in range(0, len(chunk_srt_lines), BATCH_SIZE):
+                    batch_lines = chunk_srt_lines[k:k+BATCH_SIZE]
+                    batch_content = "\n\n".join(batch_lines)
+                    
+                    print(f"正在翻譯第 {i+1} 區塊的第 {k//BATCH_SIZE + 1} 批次...")
+                    batch_res = translate_segment_pro(batch_content, f"{i}_{k}")
+                    chunk_trans_text += batch_res + "\n\n"
+                    time.sleep(1)
+            
+            full_translated_text += chunk_trans_text
+            current_time_offset += chunk_duration
 
-    # 4. 存檔並回傳
-    final_blob.upload_from_string(full_translated_text)
-    return {"status": "completed", "text": full_translated_text}
+        # 存檔
+        final_blob = bucket.blob(f"final_results/{file_id}_TW_Complete.txt")
+        final_blob.upload_from_string(full_translated_text)
+        print(f"[{file_id}] 翻譯完成並存檔！")
+
+    except Exception as e:
+        print(f"[{file_id}] 後台翻譯失敗: {e}")
+    finally:
+        # 解鎖
+        bucket.blob(f"locks/{file_id}").delete(ignore_errors=True)
 
 if __name__ == "__main__":
     import uvicorn
