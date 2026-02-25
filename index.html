@@ -74,8 +74,31 @@
     </div>
 
     <script>
-        const API_URL = ""; 
-        const CHUNK_SIZE = 25 * 1024 * 1024; 
+        const API_URL = "";
+        const CHUNK_SIZE = 25 * 1024 * 1024;
+
+        // HTML escape 防止 XSS
+        function escapeHtml(str) {
+            const div = document.createElement('div');
+            div.textContent = str;
+            return div.innerHTML;
+        }
+
+        // 帶重試的 fetch（最多重試 3 次，間隔遞增）
+        async function fetchWithRetry(url, options, maxRetries = 3) {
+            for (let attempt = 1; attempt <= maxRetries; attempt++) {
+                try {
+                    const res = await fetch(url, options);
+                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                    return res;
+                } catch (e) {
+                    if (attempt === maxRetries) throw e;
+                    const delay = attempt * 2000;
+                    console.warn(`第 ${attempt} 次上傳失敗，${delay/1000}s 後重試...`, e);
+                    await new Promise(r => setTimeout(r, delay));
+                }
+            }
+        }
         
         // 初始化載入紀錄
         document.addEventListener('DOMContentLoaded', loadHistory);
@@ -108,7 +131,8 @@
             btn.disabled = true;
             btn.innerText = "上傳中...";
 
-            const fileId = `${Date.now()}_${file.name.replace(/\s/g, '')}`;
+            const randomSuffix = Math.random().toString(36).substring(2, 8);
+            const fileId = `${Date.now()}_${randomSuffix}_${file.name.replace(/[^a-zA-Z0-9._-]/g, '')}`;
             const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
             const mode = document.getElementById('processMode').value;
 
@@ -126,7 +150,7 @@
                     fd.append("file_id", fileId);
                     fd.append("mode", mode); // 傳送模式參數
                     
-                    await fetch(`${API_URL}/upload_chunk`, { method: "POST", body: fd });
+                    await fetchWithRetry(`${API_URL}/upload_chunk`, { method: "POST", body: fd });
                 }
                 
                 document.getElementById('uploadProgress').innerText = "上傳完成！已加入背景處理佇列。";
@@ -198,46 +222,57 @@
             history.forEach(item => {
                 const tr = document.createElement('tr');
                 let statusBadge = `<span class="status-badge status-processing">處理中...</span>`;
-                let actionBtn = '';
-
                 if (item.status === 'completed') {
                     statusBadge = `<span class="status-badge status-completed">完成</span>`;
-                    actionBtn = `<button class="btn download" onclick="downloadResult('${item.id}')">下載 SRT</button>`;
                 } else if (item.status === 'error') {
                     statusBadge = `<span class="status-badge status-error">失敗</span>`;
                 }
 
+                const safeId = escapeHtml(item.id);
+                const safeName = escapeHtml(item.name);
+                const safeDate = escapeHtml(item.date);
+
                 tr.innerHTML = `
-                    <td>${item.name}</td>
-                    <td style="font-size: 0.8rem; color: #666;">${item.date}</td>
-                    <td>${statusBadge} <div id="status-${item.id}" style="font-size: 0.7rem; color: #888;"></div></td>
+                    <td>${safeName}</td>
+                    <td style="font-size: 0.8rem; color: #666;">${safeDate}</td>
+                    <td>${statusBadge} <div id="status-${safeId}" style="font-size: 0.7rem; color: #888;"></div></td>
                     <td>
-                        ${actionBtn}
-                        <button onclick="deleteHistoryItem('${item.id}')" style="margin-left: 0.5rem; border:none; background:none; cursor:pointer; color: #991b1b;">刪除</button>
+                        ${item.status === 'completed' ? `<button class="btn download" onclick="downloadResult('${safeId}')">下載 SRT</button>` : ''}
+                        <button onclick="deleteHistoryItem('${safeId}')" style="margin-left: 0.5rem; border:none; background:none; cursor:pointer; color: #991b1b;">刪除</button>
                     </td>
                 `;
                 list.appendChild(tr);
             });
         }
 
+        const MAX_POLL_ATTEMPTS = 720; // 最多輪詢 720 次 (約 1 小時)
+        const pollCounts = {};
+
         async function checkTaskStatus(fileId, totalChunks) {
+            pollCounts[fileId] = (pollCounts[fileId] || 0) + 1;
+
+            if (pollCounts[fileId] > MAX_POLL_ATTEMPTS) {
+                console.warn(`[${fileId}] 已超過最大輪詢次數，停止輪詢`);
+                updateHistoryItem(fileId, { status: 'error' });
+                delete pollCounts[fileId];
+                return;
+            }
+
             const statusDiv = document.getElementById(`status-${fileId}`);
-            
+
             try {
                 const res = await fetch(`${API_URL}/check_status/${fileId}?total_chunks=${totalChunks}`);
                 const data = await res.json();
 
                 if (data.status === "completed") {
                     updateHistoryItem(fileId, { status: 'completed', text: data.text });
+                    delete pollCounts[fileId];
                 } else {
-                    // Update progress text
                     if (statusDiv) statusDiv.innerText = data.progress || '';
-                    // Poll again in 5 seconds
                     setTimeout(() => checkTaskStatus(fileId, totalChunks), 5000);
                 }
             } catch (e) {
                 console.error("Polling error", e);
-                // Don't stop polling on transient network errors, retry
                 setTimeout(() => checkTaskStatus(fileId, totalChunks), 10000);
             }
         }
@@ -252,6 +287,8 @@
                 a.href = url;
                 a.download = `${item.name}.srt`;
                 a.click();
+                // 釋放記憶體，避免 Object URL 洩漏
+                setTimeout(() => URL.revokeObjectURL(url), 1000);
             }
         }
 

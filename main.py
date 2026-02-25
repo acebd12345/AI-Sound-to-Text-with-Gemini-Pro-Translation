@@ -1,12 +1,14 @@
 import os
+import re
 import json
 import time
 import asyncio
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, Form, BackgroundTasks
+from fastapi import FastAPI, UploadFile, Form, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from google.cloud import storage
+from google.api_core.exceptions import PreconditionFailed
 import google.generativeai as genai
 
 load_dotenv()
@@ -29,18 +31,41 @@ BUCKET_NAME = os.getenv("BUCKET_NAME")
 if not BUCKET_NAME:
     raise ValueError("BUCKET_NAME not found in environment variables")
 
+# CORS 設定：透過環境變數 ALLOWED_ORIGINS 指定允許的來源（逗號分隔）
+# 未設定時預設只允許同源請求
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "").split(",")
+ALLOWED_ORIGINS = [o.strip() for o in ALLOWED_ORIGINS if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
+    allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS else [],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
 
 @app.get("/")
 async def read_index():
     return FileResponse('index.html')
 
 UPLOAD_DIR = "/tmp"
+
+# 全域 Semaphore：限制所有翻譯任務共享的 Gemini API 併發數
+# 多人同時翻譯時，總併發不會超過此上限，避免觸發 Rate Limit
+GEMINI_SEMAPHORE = asyncio.Semaphore(8)
+
+# 驗證 file_id 防止路徑穿越攻擊
+FILE_ID_PATTERN = re.compile(r'^[\w\-\.]+$')
+
+def validate_file_id(file_id: str) -> str:
+    if not file_id or not FILE_ID_PATTERN.match(file_id):
+        raise HTTPException(status_code=400, detail="Invalid file_id: only alphanumeric, underscore, hyphen, and dot are allowed")
+    if '..' in file_id:
+        raise HTTPException(status_code=400, detail="Invalid file_id: path traversal not allowed")
+    return file_id
 
 def format_timestamp(seconds: float) -> str:
     total_milli = int(seconds * 1000)
@@ -53,9 +78,9 @@ def format_timestamp(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 # --- Gemini 分段翻譯函式 (Async) ---
-async def translate_segment_pro(srt_content, index, semaphore):
+async def translate_segment_pro(srt_content, index):
     """使用 Gemini Pro 翻譯單一區塊 (SRT)"""
-    async with semaphore:
+    async with GEMINI_SEMAPHORE:
         print(f"[Gemini Pro] 正在翻譯第 {index} 段 (SRT)...")
         model = genai.GenerativeModel(MODEL_NAME)
         
@@ -89,25 +114,28 @@ async def upload_chunk(
     file_id: str = Form(...),
     mode: str = Form("speech")
 ):
-    # 這裡我們直接上傳到 GCS 的 'raw_audio' 資料夾
-    bucket = storage_client.bucket(BUCKET_NAME)
-    
-    # 如果是第一塊，順便儲存 metadata
-    if chunk_index == 0:
-        meta_blob = bucket.blob(f"raw_audio/{file_id}/metadata.json")
-        meta_blob.upload_from_string(json.dumps({"mode": mode}))
+    validate_file_id(file_id)
 
-    blob = bucket.blob(f"raw_audio/{file_id}/{chunk_index}")
-    blob.upload_from_file(file_chunk.file)
-    
-    # 這裡省略觸發 GPU 轉錄的代碼 (假設 Eventarc 已經設定好去觸發另一個 Cloud Run)
-    # 或者您可以在這裡直接呼叫 GPU Service
-    
-    return {"status": "uploaded", "index": chunk_index}
+    try:
+        bucket = storage_client.bucket(BUCKET_NAME)
+
+        # 如果是第一塊，順便儲存 metadata
+        if chunk_index == 0:
+            meta_blob = bucket.blob(f"raw_audio/{file_id}/metadata.json")
+            meta_blob.upload_from_string(json.dumps({"mode": mode}))
+
+        blob = bucket.blob(f"raw_audio/{file_id}/{chunk_index}")
+        blob.upload_from_file(file_chunk.file)
+
+        return {"status": "uploaded", "index": chunk_index}
+    except Exception as e:
+        print(f"上傳失敗 (file_id={file_id}, chunk={chunk_index}): {e}")
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 # --- 核心：狀態檢查與自動合併接口 ---
 @app.get("/check_status/{file_id}")
 async def check_status(file_id: str, total_chunks: int, background_tasks: BackgroundTasks):
+    validate_file_id(file_id)
     bucket = storage_client.bucket(BUCKET_NAME)
     
     # 1. 檢查 GPU 轉錄是否全部完成
@@ -135,14 +163,41 @@ async def check_status(file_id: str, total_chunks: int, background_tasks: Backgr
         content = final_blob.download_as_text()
         return {"status": "completed", "text": content}
     
-    # 3. 檢查是否正在翻譯中 (Lock)
+    # 3. 嘗試取得 Lock（原子性操作，防止競態條件）
     lock_blob = bucket.blob(f"locks/{file_id}")
-    if lock_blob.exists():
-        return {"status": "processing", "progress": "AI 正在翻譯中 (請稍候)..."}
+    LOCK_TTL_SECONDS = 1800  # Lock 過期時間：30 分鐘
 
-    # 4. 尚未翻譯，啟動後台任務
+    # 檢查是否有現存的 lock
+    if lock_blob.exists():
+        try:
+            lock_data = json.loads(lock_blob.download_as_text())
+            lock_time = lock_data.get("locked_at", 0)
+            if time.time() - lock_time < LOCK_TTL_SECONDS:
+                return {"status": "processing", "progress": "AI 正在翻譯中 (請稍候)..."}
+            else:
+                # Lock 過期，刪除後重新嘗試取得
+                print(f"[{file_id}] Lock 已過期 (超過 {LOCK_TTL_SECONDS}s)，重新啟動翻譯...")
+                try:
+                    lock_blob.delete()
+                except Exception:
+                    pass
+        except Exception:
+            # Lock 資料格式錯誤，嘗試刪除並重新取得
+            try:
+                lock_blob.delete()
+            except Exception:
+                pass
+
+    # 4. 嘗試原子性建立 Lock（if_generation_match=0 確保物件不存在時才寫入）
     print("啟動後台翻譯任務...")
-    lock_blob.upload_from_string("locked") # 上鎖
+    try:
+        lock_blob.upload_from_string(
+            json.dumps({"locked_at": time.time()}),
+            if_generation_match=0
+        )
+    except PreconditionFailed:
+        # 其他請求已搶先建立 lock，不重複啟動翻譯
+        return {"status": "processing", "progress": "AI 正在翻譯中 (請稍候)..."}
     background_tasks.add_task(run_translation_background, file_id, total_chunks, bucket)
     
     return {"status": "processing", "progress": "已排入翻譯佇列..."}
@@ -163,7 +218,6 @@ async def run_translation_background(file_id, total_chunks, bucket):
         
         # 2. 準備翻譯任務
         print(f"[{file_id}] 準備翻譯任務...")
-        semaphore = asyncio.Semaphore(8) # 限制同時 8 個請求以免被 Rate Limit
         translation_tasks = []
         ordered_batches = [] # 用來存放順序資訊 (chunk_index, batch_index)
         
@@ -194,7 +248,7 @@ async def run_translation_background(file_id, total_chunks, bucket):
                     batch_content = "\n\n".join(batch_lines)
                     
                     # 建立 Async Task
-                    task = translate_segment_pro(batch_content, f"{i}_{k}", semaphore)
+                    task = translate_segment_pro(batch_content, f"{i}_{k}")
                     translation_tasks.append(task)
                     ordered_batches.append((i, k)) # 紀錄順序
 
@@ -219,7 +273,10 @@ async def run_translation_background(file_id, total_chunks, bucket):
         print(f"[{file_id}] 後台翻譯失敗: {e}")
     finally:
         # 解鎖
-        bucket.blob(f"locks/{file_id}").delete(ignore_errors=True)
+        try:
+            bucket.blob(f"locks/{file_id}").delete()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     import uvicorn

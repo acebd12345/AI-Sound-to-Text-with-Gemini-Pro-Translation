@@ -2,6 +2,7 @@ import os
 import json
 import traceback
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from faster_whisper import WhisperModel
 from google.cloud import storage
 
@@ -23,6 +24,10 @@ except Exception as e:
 
 storage_client = storage.Client()
 
+@app.get("/health")
+async def health_check():
+    return {"status": "ok", "model_loaded": model is not None}
+
 @app.post("/")
 async def handle_event(request: Request):
     """
@@ -30,7 +35,14 @@ async def handle_event(request: Request):
     當 GCS 有新檔案寫入時，GCP 會將事件資料 POST 到這裡。
     """
     print("收到觸發請求...")
-    
+
+    if model is None:
+        print("錯誤：Whisper 模型未載入，無法處理請求")
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "message": "Whisper model not loaded. GPU environment may be unavailable."}
+        )
+
     # 1. 解析 CloudEvent 資料
     event = await request.json()
     
@@ -61,17 +73,23 @@ async def handle_event(request: Request):
             print(f"跳過非 raw_audio 檔案: {file_name}")
             return {"status": "skipped"}
 
+        # 跳過 metadata.json，它不是音訊檔案
+        if file_name.endswith("metadata.json"):
+            print(f"跳過 metadata 檔案: {file_name}")
+            return {"status": "skipped"}
+
         print(f"開始處理檔案: gs://{bucket_name}/{file_name}")
 
-        # 2. 下載檔案到暫存區 (/tmp)
-        local_input_path = f"/tmp/{os.path.basename(file_name)}"
+        # 解析 file_id 與 chunk_index
+        path_parts = file_name.split('/')
+        file_id = path_parts[-2] if len(path_parts) >= 3 else "unknown"
+        chunk_index = path_parts[-1] if len(path_parts) >= 3 else os.path.basename(file_name)
+
+        # 2. 下載檔案到暫存區 (/tmp)，用 file_id + chunk_index 確保路徑唯一
+        local_input_path = f"/tmp/{file_id}_{chunk_index}"
         bucket = storage_client.bucket(bucket_name)
         blob = bucket.blob(file_name)
         blob.download_to_filename(local_input_path)
-
-        # 解析 file_id 以便讀取 metadata
-        path_parts = file_name.split('/')
-        file_id = path_parts[-2] if len(path_parts) >= 3 else "unknown"
 
         # 預設參數 (Speech)
         use_vad = True
@@ -121,15 +139,10 @@ async def handle_event(request: Request):
 
         # 5. 上傳結果到 GCS (transcripts 資料夾)
         # 檔名轉換: raw_audio/xyz/1 -> transcripts/xyz_part_1.json
-        # 這裡做一個簡單的檔名處理，確保對應得到
-        # 假設 file_name 是 "raw_audio/my_meeting_id/3" (第4個切片)
-        path_parts = file_name.split('/')
+        # file_id 和 chunk_index 已在上方解析
         if len(path_parts) >= 3:
-            file_id = path_parts[-2] # my_meeting_id
-            chunk_index = path_parts[-1] # 3
             result_blob_name = f"transcripts/{file_id}_part_{chunk_index}.json"
         else:
-            # Fallback 命名
             safe_name = file_name.replace('/', '_')
             result_blob_name = f"transcripts/{safe_name}.json"
 
