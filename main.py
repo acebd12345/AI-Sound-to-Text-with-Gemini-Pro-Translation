@@ -160,8 +160,10 @@ async def check_status(file_id: str, total_chunks: int, background_tasks: Backgr
     final_blob = bucket.blob(final_blob_path)
     
     if final_blob.exists():
-        content = final_blob.download_as_text()
-        return {"status": "completed", "text": content}
+        srt_content = final_blob.download_as_text()
+        plain_blob = bucket.blob(f"final_results/{file_id}_TW_PlainText.txt")
+        plain_content = plain_blob.download_as_text() if plain_blob.exists() else ""
+        return {"status": "completed", "srt_text": srt_content, "plain_text": plain_content}
     
     # 3. 嘗試取得 Lock（原子性操作，防止競態條件）
     lock_blob = bucket.blob(f"locks/{file_id}")
@@ -264,9 +266,28 @@ async def run_translation_background(file_id, total_chunks, bucket):
         else:
             full_translated_text = ""
 
-        # 存檔
+        # 存檔 (SRT)
         final_blob = bucket.blob(f"final_results/{file_id}_TW_Complete.txt")
         final_blob.upload_from_string(full_translated_text)
+
+        # 解析 SRT 產生純文字版本（去除序號與時間戳）
+        plain_lines = []
+        for line in full_translated_text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                if plain_lines and plain_lines[-1] != '':
+                    plain_lines.append('')
+                continue
+            if stripped.isdigit():
+                continue
+            if '-->' in stripped:
+                continue
+            plain_lines.append(stripped)
+
+        plain_text = '\n'.join(plain_lines).strip() + '\n'
+        plain_blob = bucket.blob(f"final_results/{file_id}_TW_PlainText.txt")
+        plain_blob.upload_from_string(plain_text)
+
         print(f"[{file_id}] 翻譯完成並存檔！")
 
     except Exception as e:
