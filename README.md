@@ -128,14 +128,175 @@ GPU Worker (`gpu-worker/main.py`) 設計為由 Eventarc 觸發。若要在本地
 
 本專案已針對 GCP Cloud Run 進行優化，支援 GPU 加速與 Serverless 架構。
 
-詳細部署步驟請參閱：[**DEPLOY_GCP.md**](./DEPLOY_GCP.md)
+### 第一步：準備工作
 
-部署概略：
-1.  建立 GCS Bucket。
-2.  部署 `main.py` 到 Cloud Run (CPU)。
-3.  部署 `gpu-worker/` 到 Cloud Run (GPU)。
-4.  設定 Eventarc 觸發器，連接 GCS 與 GPU Worker。
-5.  設定環境變數（`GEMINI_API_KEY`、`BUCKET_NAME`、`ALLOWED_ORIGINS`）。
+**1. 安裝並登入 Google Cloud CLI**
+
+```bash
+gcloud auth login
+gcloud config set project [您的專案ID]
+```
+
+**2. 啟用必要 API**
+
+```bash
+gcloud services enable \
+  run.googleapis.com \
+  storage.googleapis.com \
+  eventarc.googleapis.com \
+  aiplatform.googleapis.com \
+  artifactregistry.googleapis.com
+```
+
+**3. 建立 Storage Bucket**
+
+```bash
+export BUCKET_NAME="your-unique-bucket-name"
+export LOCATION="us-central1"
+
+gcloud storage buckets create gs://$BUCKET_NAME --location=$LOCATION
+```
+
+### 第二步：部署後端 (API Server)
+
+在專案根目錄執行，將 `[您的API_KEY]` 替換為真實的 Gemini API Key：
+
+```bash
+gcloud run deploy sound-to-text-web \
+  --source . \
+  --region $LOCATION \
+  --allow-unauthenticated \
+  --set-env-vars GEMINI_API_KEY=[您的API_KEY] \
+  --set-env-vars BUCKET_NAME=$BUCKET_NAME \
+  --set-env-vars ALLOWED_ORIGINS=https://sound-to-text-web-[hash].a.run.app
+```
+
+部署完成後會顯示一個 URL（例如 `https://sound-to-text-web-xyz.a.run.app`），請記下此 URL 並回填到 `ALLOWED_ORIGINS`：
+
+```bash
+gcloud run services update sound-to-text-web \
+  --region $LOCATION \
+  --update-env-vars ALLOWED_ORIGINS=https://sound-to-text-web-xyz.a.run.app
+```
+
+### 第三步：部署 GPU Worker
+
+進入 Worker 目錄並部署至 Cloud Run（需 GPU，使用 NVIDIA L4）：
+
+```bash
+cd gpu-worker
+
+gcloud run deploy gpu-whisper-worker \
+  --source . \
+  --region $LOCATION \
+  --no-allow-unauthenticated \
+  --gpu 1 \
+  --gpu-type nvidia-l4 \
+  --memory 16Gi \
+  --cpu 4 \
+  --concurrency 1 \
+  --timeout 3600
+
+cd ..
+```
+
+> Cloud Run GPU 目前僅在特定區域可用（如 `us-central1`）。若遇到配額不足錯誤，請申請配額或切換區域。
+
+### 第四步：設定 Eventarc 觸發器
+
+這是最關鍵的一步：將 GCS 的「檔案上傳事件」連接到「GPU Worker」。
+
+**1. 授權 GCS 發布事件**
+
+```bash
+SERVICE_ACCOUNT=$(gcloud storage service-agent)
+
+gcloud projects add-iam-policy-binding $(gcloud config get-value project) \
+  --member serviceAccount:$SERVICE_ACCOUNT \
+  --role roles/pubsub.publisher
+```
+
+**2. 取得 Compute Engine Service Account**
+
+```bash
+PROJECT_NUMBER=$(gcloud projects describe $(gcloud config get-value project) --format="value(projectNumber)")
+SERVICE_ACCOUNT="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+
+echo "將使用 Service Account: $SERVICE_ACCOUNT"
+```
+
+**3. 建立觸發器**
+
+```bash
+# 確認 BUCKET_NAME 前後沒有多餘空白
+export BUCKET_NAME=$(echo $BUCKET_NAME | xargs)
+
+gcloud eventarc triggers create trigger-whisper \
+  --location=$LOCATION \
+  --destination-run-service=gpu-whisper-worker \
+  --destination-run-region=$LOCATION \
+  --event-filters="type=google.cloud.storage.object.v1.finalized" \
+  --event-filters="bucket=$BUCKET_NAME" \
+  --service-account=$SERVICE_ACCOUNT
+```
+
+### 第五步：測試
+
+1. 開啟第二步獲得的網頁 URL。
+2. 上傳一個測試音檔。
+3. 觀察狀態變化：
+   - 「上傳完成」→ Eventarc 觸發 Worker 開始轉錄
+   - 「等待轉錄中」→ Worker 正在處理
+   - 「AI 正在翻譯中」→ Gemini Pro 翻譯中
+   - 「完成」→ 可下載 SRT 字幕檔
+
+### 部署後檢查
+
+**查看後端日誌：**
+
+```bash
+gcloud logging read \
+  "resource.type=cloud_run_revision AND resource.labels.service_name=sound-to-text-web" \
+  --limit 20 --format="value(textPayload)"
+```
+
+**查看 GPU Worker 日誌：**
+
+```bash
+gcloud logging read \
+  "resource.type=cloud_run_revision AND resource.labels.service_name=gpu-whisper-worker" \
+  --limit 20 --format="value(textPayload)"
+```
+
+**檢查 GCS 檔案：**
+
+```bash
+gcloud storage ls gs://$BUCKET_NAME/raw_audio/
+gcloud storage ls gs://$BUCKET_NAME/transcripts/
+gcloud storage ls gs://$BUCKET_NAME/final_results/
+```
+
+**健康檢查：**
+
+```bash
+# API Server
+curl https://sound-to-text-web-xyz.a.run.app/health
+
+# GPU Worker（需認證）
+gcloud run services proxy gpu-whisper-worker --region=$LOCATION &
+curl http://localhost:8080/health
+```
+
+### 常見問題
+
+| 問題 | 原因 | 解決方法 |
+|------|------|----------|
+| 一直顯示「處理中」 | Eventarc 未觸發 Worker | 檢查 Eventarc 觸發器狀態與 Worker 日誌 |
+| `ValueError: Bucket names must start and end with a number or letter` | `BUCKET_NAME` 含有空白 | `export BUCKET_NAME=$(echo $BUCKET_NAME \| xargs)` 後更新服務 |
+| GPU 部署失敗 | GPU 配額不足 | 申請 L4 配額或嘗試 `us-central1` 區域 |
+| `ModuleNotFoundError: No module named 'fastapi'` | Dockerfile 被忽略，使用了 Buildpacks | 確認檔名為 `Dockerfile`（非 `Dockerfile.txt`） |
+| `Missing required argument [--clear-base-image]` | 先前部署用了 Buildpacks | 部署指令加上 `--clear-base-image` |
+| `Quota violated` / `Max instances must be set to X` | GPU 實例數量超過配額 | 加上 `--max-instances 1` 或申請增加配額 |
 
 ## 📂 目錄結構
 
