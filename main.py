@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, Form, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from google.cloud import storage
 from google.api_core.exceptions import PreconditionFailed
 import google.generativeai as genai
@@ -42,6 +43,15 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+# HSTS：強制瀏覽器使用 HTTPS 連線（max-age=1 年）
+class HSTSMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        return response
+
+app.add_middleware(HSTSMiddleware)
 
 @app.get("/health")
 async def health_check():
