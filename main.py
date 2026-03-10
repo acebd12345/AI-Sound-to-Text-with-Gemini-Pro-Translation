@@ -2,6 +2,7 @@ import os
 import re
 import json
 import time
+import random
 import asyncio
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, Form, BackgroundTasks, HTTPException
@@ -17,15 +18,37 @@ load_dotenv()
 app = FastAPI()
 
 # --- 設定區 ---
-# 請務必確認 GCP 服務帳號有權限，且 API KEY 正確
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-# 您指定要用 Pro (API 代號目前為 gemini-3-pro-preview)
+# 支援多 API Key 輪替：環境變數 GEMINI_API_KEYS（逗號分隔）優先，
+# 若未設定則退回使用單一 GEMINI_API_KEY
 MODEL_NAME = "gemini-3-pro-preview"
 
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY not found in environment variables")
+_keys_str = os.getenv("GEMINI_API_KEYS", "")
+GEMINI_API_KEYS = [k.strip() for k in _keys_str.split(",") if k.strip()]
+if not GEMINI_API_KEYS:
+    _single = os.getenv("GEMINI_API_KEY", "")
+    if _single:
+        GEMINI_API_KEYS = [_single]
 
-genai.configure(api_key=GEMINI_API_KEY)
+if not GEMINI_API_KEYS:
+    raise ValueError("GEMINI_API_KEY or GEMINI_API_KEYS not found in environment variables")
+
+print(f"已載入 {len(GEMINI_API_KEYS)} 組 Gemini API Key")
+
+# 用第一把 key 做預設設定（相容舊邏輯）
+genai.configure(api_key=GEMINI_API_KEYS[0])
+
+# Key 輪替計數器（Round-Robin）
+_key_counter = 0
+_key_lock = asyncio.Lock()
+
+async def get_next_api_key() -> str:
+    """Round-Robin 取得下一把 API Key"""
+    global _key_counter
+    async with _key_lock:
+        key = GEMINI_API_KEYS[_key_counter % len(GEMINI_API_KEYS)]
+        _key_counter += 1
+        return key
+
 storage_client = storage.Client()
 BUCKET_NAME = os.getenv("BUCKET_NAME")
 
@@ -87,13 +110,13 @@ def format_timestamp(seconds: float) -> str:
     millis = total_milli % 1000
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
-# --- Gemini 分段翻譯函式 (Async) ---
+# --- Gemini 分段翻譯函式 (Async + Retry + Key 輪替) ---
+MAX_RETRIES = 3
+RETRY_BASE_DELAY = 2  # 秒，exponential backoff 基底
+
 async def translate_segment_pro(srt_content, index):
-    """使用 Gemini Pro 翻譯單一區塊 (SRT)"""
+    """使用 Gemini Pro 翻譯單一區塊 (SRT)，含重試與 Key 輪替"""
     async with GEMINI_SEMAPHORE:
-        print(f"[Gemini Pro] 正在翻譯第 {index} 段 (SRT)...")
-        model = genai.GenerativeModel(MODEL_NAME)
-        
         prompt = f"""You are a professional subtitle translator and Traditional Chinese localization expert.
 Task: Translate and Convert the following SRT subtitle content into Traditional Chinese (Taiwan) (繁體中文).
 
@@ -106,14 +129,24 @@ CRITICAL RULES:
 6. Do not include any explanation or markdown formatting (like ```srt). Just the raw SRT content.
 
 {srt_content}"""
-        
-        try:
-            # 使用非同步生成
-            response = await model.generate_content_async(prompt)
-            return response.text.strip()
-        except Exception as e:
-            print(f"第 {index} 段翻譯失敗: {e}")
-            return srt_content # 失敗則回傳原文
+
+        for attempt in range(MAX_RETRIES):
+            api_key = await get_next_api_key()
+            try:
+                print(f"[Gemini Pro] 翻譯第 {index} 段 (嘗試 {attempt + 1}/{MAX_RETRIES}, Key ...{api_key[-4:]})...")
+                genai.configure(api_key=api_key)
+                model = genai.GenerativeModel(MODEL_NAME)
+                response = await model.generate_content_async(prompt)
+                return response.text.strip()
+            except Exception as e:
+                print(f"第 {index} 段翻譯失敗 (嘗試 {attempt + 1}): {e}")
+                if attempt < MAX_RETRIES - 1:
+                    delay = RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 1)
+                    print(f"  → {delay:.1f} 秒後重試...")
+                    await asyncio.sleep(delay)
+
+        print(f"⚠ 第 {index} 段翻譯全部重試失敗，回傳原文")
+        return srt_content
 
 # --- 上傳接口 (保持不變) ---
 @app.post("/upload_chunk")
@@ -264,10 +297,25 @@ async def run_translation_background(file_id, total_chunks, bucket):
                     translation_tasks.append(task)
                     ordered_batches.append((i, k)) # 紀錄順序
 
-        # 3. 平行執行翻譯 (Network Bound)
+        # 3. 分波執行翻譯（每波最多 8 個，波與波之間間隔 2 秒，避免瞬間 burst）
+        WAVE_SIZE = 8
+        WAVE_DELAY = 2  # 秒
+        translated_results = []
+
         if translation_tasks:
-            print(f"[{file_id}] 啟動 {len(translation_tasks)} 個翻譯任務 (併發)...")
-            translated_results = await asyncio.gather(*translation_tasks)
+            total_waves = (len(translation_tasks) + WAVE_SIZE - 1) // WAVE_SIZE
+            print(f"[{file_id}] 啟動 {len(translation_tasks)} 個翻譯任務，分 {total_waves} 波執行 (每波 {WAVE_SIZE} 個)...")
+
+            for w in range(0, len(translation_tasks), WAVE_SIZE):
+                wave = translation_tasks[w:w + WAVE_SIZE]
+                wave_num = w // WAVE_SIZE + 1
+                print(f"[{file_id}] 第 {wave_num}/{total_waves} 波 ({len(wave)} 個任務)...")
+                wave_results = await asyncio.gather(*wave)
+                translated_results.extend(wave_results)
+
+                # 波與波之間延遲，最後一波不用等
+                if w + WAVE_SIZE < len(translation_tasks):
+                    await asyncio.sleep(WAVE_DELAY)
             
             # 4. 組合結果
             full_translated_text = ""
