@@ -34,20 +34,26 @@ if not GEMINI_API_KEYS:
 
 print(f"已載入 {len(GEMINI_API_KEYS)} 組 Gemini API Key")
 
-# 用第一把 key 做預設設定（相容舊邏輯）
+# 為每把 Key 預先建立獨立的 GenerativeModel，避免 genai.configure 全域競爭
+GEMINI_MODELS = []
+for _key in GEMINI_API_KEYS:
+    genai.configure(api_key=_key)
+    GEMINI_MODELS.append(genai.GenerativeModel(MODEL_NAME))
+
+# 用第一把 key 做預設（相容舊邏輯）
 genai.configure(api_key=GEMINI_API_KEYS[0])
 
 # Key 輪替計數器（Round-Robin）
-_key_counter = 0
-_key_lock = asyncio.Lock()
+_model_counter = 0
+_model_lock = asyncio.Lock()
 
-async def get_next_api_key() -> str:
-    """Round-Robin 取得下一把 API Key"""
-    global _key_counter
-    async with _key_lock:
-        key = GEMINI_API_KEYS[_key_counter % len(GEMINI_API_KEYS)]
-        _key_counter += 1
-        return key
+async def get_next_model() -> genai.GenerativeModel:
+    """Round-Robin 取得下一個預建立的 Model（每個綁定不同 API Key）"""
+    global _model_counter
+    async with _model_lock:
+        model = GEMINI_MODELS[_model_counter % len(GEMINI_MODELS)]
+        _model_counter += 1
+        return model
 
 storage_client = storage.Client()
 BUCKET_NAME = os.getenv("BUCKET_NAME")
@@ -131,11 +137,9 @@ CRITICAL RULES:
 {srt_content}"""
 
         for attempt in range(MAX_RETRIES):
-            api_key = await get_next_api_key()
+            model = await get_next_model()
             try:
-                print(f"[Gemini Pro] 翻譯第 {index} 段 (嘗試 {attempt + 1}/{MAX_RETRIES}, Key ...{api_key[-4:]})...")
-                genai.configure(api_key=api_key)
-                model = genai.GenerativeModel(MODEL_NAME)
+                print(f"[Gemini Pro] 翻譯第 {index} 段 (嘗試 {attempt + 1}/{MAX_RETRIES})...")
                 response = await model.generate_content_async(prompt)
                 return response.text.strip()
             except Exception as e:
