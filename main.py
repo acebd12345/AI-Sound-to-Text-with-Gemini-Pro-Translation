@@ -136,7 +136,7 @@ RETRY_BASE_DELAY = 2  # 秒，exponential backoff 基底
 API_TIMEOUT = 120  # 秒，單次 API 呼叫超時時間（給 Gemini 充足時間處理）
 
 # 初始化 OpenCC 轉換器 (s2twp.json 代表: 簡體轉繁體台灣，包含慣用語轉換)
-cc = opencc.OpenCC('s2twp.json')
+cc = opencc.OpenCC('s2twp')
 
 async def translate_segment_pro(srt_content, index):
     """使用 Gemini Pro 翻譯單一區塊 (SRT)，含重試與 Key 輪替"""
