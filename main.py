@@ -119,7 +119,7 @@ def format_timestamp(seconds: float) -> str:
 # --- Gemini 分段翻譯函式 (Async + Retry + Key 輪替) ---
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 2  # 秒，exponential backoff 基底
-API_TIMEOUT = 60  # 秒，單次 API 呼叫超時時間
+API_TIMEOUT = 120  # 秒，單次 API 呼叫超時時間（給 Gemini 充足時間處理）
 
 async def translate_segment_pro(srt_content, index):
     """使用 Gemini Pro 翻譯單一區塊 (SRT)，含重試與 Key 輪替"""
@@ -282,7 +282,7 @@ async def run_translation_background(file_id, total_chunks, bucket):
         
         current_time_offset = 0.0
         current_srt_index = 1
-        BATCH_SIZE = 50
+        BATCH_SIZE = 20  # 小批次翻譯，提高精準度
 
         # 先預處理所有 SRT 文本
         for i, json_content in enumerate(results_json):
