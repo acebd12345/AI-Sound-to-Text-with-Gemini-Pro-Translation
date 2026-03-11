@@ -119,6 +119,7 @@ def format_timestamp(seconds: float) -> str:
 # --- Gemini 分段翻譯函式 (Async + Retry + Key 輪替) ---
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 2  # 秒，exponential backoff 基底
+API_TIMEOUT = 60  # 秒，單次 API 呼叫超時時間
 
 async def translate_segment_pro(srt_content, index):
     """使用 Gemini Pro 翻譯單一區塊 (SRT)，含重試與 Key 輪替"""
@@ -140,8 +141,17 @@ CRITICAL RULES:
             model = await get_next_model()
             try:
                 print(f"[Gemini Pro] 翻譯第 {index} 段 (嘗試 {attempt + 1}/{MAX_RETRIES})...")
-                response = await model.generate_content_async(prompt)
+                response = await asyncio.wait_for(
+                    model.generate_content_async(prompt),
+                    timeout=API_TIMEOUT
+                )
                 return response.text.strip()
+            except asyncio.TimeoutError:
+                print(f"第 {index} 段翻譯超時 ({API_TIMEOUT}s) (嘗試 {attempt + 1})")
+                if attempt < MAX_RETRIES - 1:
+                    delay = RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 1)
+                    print(f"  → {delay:.1f} 秒後換 Key 重試...")
+                    await asyncio.sleep(delay)
             except Exception as e:
                 print(f"第 {index} 段翻譯失敗 (嘗試 {attempt + 1}): {e}")
                 if attempt < MAX_RETRIES - 1:
