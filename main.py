@@ -43,7 +43,10 @@ genai.configure(api_key=GEMINI_API_KEYS[0])
 
 GEMINI_MODELS = []
 for _key in GEMINI_API_KEYS:
-    model = genai.GenerativeModel(MODEL_NAME)
+    model = genai.GenerativeModel(
+        MODEL_NAME,
+        system_instruction="你是一個專業的繁體中文（台灣）翻譯專家。你的唯一任務是將傳入的字幕內容，完美且毫無遺漏地翻譯或轉換為台灣慣用的繁體中文。絕對不允許輸出任何簡體字。"
+    )
     client_opts = client_options_lib.ClientOptions(
         api_key=_key,
         api_endpoint="generativelanguage.googleapis.com",
@@ -142,8 +145,9 @@ CRITICAL RULES:
 2. ONLY translate/rewrite the subtitle text lines.
 3. Output the result in standard SRT format.
 4. ENSURE ALL TEXT IS IN TRADITIONAL CHINESE (Taiwan). Convert any Simplified Chinese characters or foreign terms into standard Taiwan Traditional Chinese.
-5. DETECT HALLUCINATIONS: If a subtitle line appears to be an ASR hallucination (e.g., repetitive nonsense, "Subscribe", "Thanks for watching", or random characters unrelated to context), replace the text with "..." or leave it blank.
-6. Do not include any explanation or markdown formatting (like ```srt). Just the raw SRT content.
+5. ABSOLUTELY NO SIMPLIFIED CHINESE. You must not leave any Simplified Chinese characters (簡體字) in the output.
+6. DETECT HALLUCINATIONS: If a subtitle line appears to be an ASR hallucination (e.g., repetitive nonsense, "Subscribe", "Thanks for watching", or random characters unrelated to context), replace the text with "..." or leave it blank.
+7. Do not include any explanation or markdown formatting (like ```srt). Just the raw SRT content.
 
 {srt_content}"""
 
@@ -152,7 +156,12 @@ CRITICAL RULES:
             try:
                 print(f"[Gemini Pro] 翻譯第 {index} 段 (嘗試 {attempt + 1}/{MAX_RETRIES})...")
                 response = await asyncio.wait_for(
-                    model.generate_content_async(prompt),
+                    model.generate_content_async(
+                        prompt,
+                        generation_config=genai.types.GenerationConfig(
+                            temperature=0.2,
+                        )
+                    ),
                     timeout=API_TIMEOUT
                 )
                 return response.text.strip()
