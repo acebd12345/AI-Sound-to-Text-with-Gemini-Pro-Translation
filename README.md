@@ -8,6 +8,8 @@
 
 *   **高精準度轉錄**：使用 `faster-whisper` (Large-v3-turbo 模型) 進行語音識別，支援多語言輸入。
 *   **專業級翻譯**：整合 Google Gemini 3 Pro (Preview) 模型，將轉錄內容翻譯成流暢的繁體中文 (台灣)。
+*   **簡轉繁保障**：使用 OpenCC (s2twp) 預處理，即使 Gemini API 失敗也保證輸出繁體中文。
+*   **多 API Key 輪替**：支援多把 Gemini API Key Round-Robin 輪替，搭配自動重試機制，大幅提升長音檔翻譯穩定性。
 *   **雙模式支援**：
     *   **一般對話/會議模式**：自動過濾靜音，適合訪談、會議記錄。
     *   **歌曲/歌詞模式**：保留人聲細節與時間軸，適合製作歌詞字幕。
@@ -56,14 +58,21 @@ GPU Worker 轉錄 → JSON 存至 transcripts/
     ↓
 前端每 5 秒輪詢 /check_status（最多 1 小時）
     ↓
-全部轉錄完成 → 觸發 Gemini Pro 翻譯（全域併發上限 8）
+全部轉錄完成 → OpenCC 預處理 (簡轉繁)
     ↓
-翻譯完成 → 存至 final_results/ → 前端下載 SRT
+Gemini Pro 分波翻譯（每波 8 個，每批 20 段，失敗自動重試 3 次）
+    ↓
+翻譯完成 → 存至 final_results/ → 前端下載 SRT / 純文字
 ```
 
 ### 併發處理設計
 
 *   **全域 Semaphore**：Gemini API 請求使用全域共享的 Semaphore（上限 8），多人同時翻譯時不會超出 Rate Limit。
+*   **多 API Key 輪替**：支援 `GEMINI_API_KEYS` 環境變數（逗號分隔），為每把 Key 建立獨立的 gRPC client，Round-Robin 輪替避免單一 Key 觸發 Rate Limit。
+*   **分波執行**：翻譯任務分波送出（每波最多 8 個），波與波之間間隔 2 秒，避免瞬間 burst。
+*   **Retry + Backoff**：每段翻譯失敗自動重試 3 次，間隔 2s → 4s → 8s（含隨機抖動），每次重試換不同 Key。
+*   **API Timeout**：單次 Gemini API 呼叫超時 120 秒，超時自動換 Key 重試。
+*   **OpenCC 預處理**：翻譯前先以 OpenCC (s2twp) 將簡體轉繁體，即使 API 全部失敗，回傳的也是繁體中文。
 *   **原子性 Lock**：使用 GCS `if_generation_match=0` 條件寫入，確保同一檔案不會被重複翻譯。
 *   **Lock TTL**：鎖定機制包含 30 分鐘過期時間，伺服器崩潰時不會造成永久死鎖。
 *   **唯一 file_id**：前端使用 `時間戳 + 隨機字串 + 檔名` 生成，避免多人同時上傳碰撞。
@@ -95,10 +104,14 @@ GPU Worker 轉錄 → JSON 存至 transcripts/
     ```
     編輯 `.env` 檔案：
     ```env
+    # 多把 Key 輪替（推薦，逗號分隔）
+    GEMINI_API_KEYS=key1,key2,key3,key4,key5,key6,key7,key8
+    # 或單把 Key（向下相容）
     GEMINI_API_KEY=您的_Gemini_API_Key
     BUCKET_NAME=您的_GCS_Bucket_名稱
     ALLOWED_ORIGINS=http://localhost:8000,https://your-app.run.app
     ```
+    > **注意**：API Key 的「應用程式限制」必須設為「無」，不可設定 HTTP Referrer 限制，否則從 Cloud Run 發出的請求會被 403 擋掉。
 
 3.  **安裝依賴**
     ```bash
@@ -159,16 +172,21 @@ gcloud storage buckets create gs://$BUCKET_NAME --location=$LOCATION
 
 ### 第二步：部署後端 (API Server)
 
-在專案根目錄執行，將 `[您的API_KEY]` 替換為真實的 Gemini API Key：
+在專案根目錄執行。建議使用多把 API Key 以提升長音檔翻譯穩定性：
 
 ```bash
+# 先建立 env.yaml（避免逗號被 gcloud 誤解析）
+cat > /tmp/env.yaml << EOF
+GEMINI_API_KEYS: "key1,key2,key3,key4,key5,key6,key7,key8"
+BUCKET_NAME: "$BUCKET_NAME"
+ALLOWED_ORIGINS: "https://sound-to-text-web-[hash].a.run.app"
+EOF
+
 gcloud run deploy sound-to-text-web \
   --source . \
   --region $LOCATION \
   --allow-unauthenticated \
-  --set-env-vars GEMINI_API_KEY=[您的API_KEY] \
-  --set-env-vars BUCKET_NAME=$BUCKET_NAME \
-  --set-env-vars ALLOWED_ORIGINS=https://sound-to-text-web-[hash].a.run.app
+  --env-vars-file /tmp/env.yaml
 ```
 
 部署完成後會顯示一個 URL（例如 `https://sound-to-text-web-xyz.a.run.app`），請記下此 URL 並回填到 `ALLOWED_ORIGINS`：
@@ -297,6 +315,8 @@ curl http://localhost:8080/health
 | `ModuleNotFoundError: No module named 'fastapi'` | Dockerfile 被忽略，使用了 Buildpacks | 確認檔名為 `Dockerfile`（非 `Dockerfile.txt`） |
 | `Missing required argument [--clear-base-image]` | 先前部署用了 Buildpacks | 部署指令加上 `--clear-base-image` |
 | `Quota violated` / `Max instances must be set to X` | GPU 實例數量超過配額 | 加上 `--max-instances 1` 或申請增加配額 |
+| `403 API_KEY_HTTP_REFERRER_BLOCKED` | API Key 設了 HTTP Referrer 限制 | 到 GCP Console → 憑證，將 Key 的應用程式限制改為「無」 |
+| 長音檔出現簡體字 | Gemini 翻譯部分段落失敗，回傳 Whisper 原文 | 確認所有 API Key 無限制 + 使用多把 Key (`GEMINI_API_KEYS`) |
 
 ## 📂 目錄結構
 
