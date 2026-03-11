@@ -12,6 +12,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from google.cloud import storage
 from google.api_core.exceptions import PreconditionFailed
 import google.generativeai as genai
+import google.ai.generativelanguage as glm
+from google.api_core import client_options as client_options_lib
 
 load_dotenv()
 
@@ -34,21 +36,29 @@ if not GEMINI_API_KEYS:
 
 print(f"已載入 {len(GEMINI_API_KEYS)} 組 Gemini API Key")
 
-# 為每把 Key 預先建立獨立的 GenerativeModel，避免 genai.configure 全域競爭
+# 為每把 Key 建立獨立的 gRPC client，注入到 GenerativeModel
+# genai.configure 是全域的，GenerativeModel 不會綁定 Key，
+# 所以必須手動建立獨立 client 注入，才能真正做到多 Key 輪替
+genai.configure(api_key=GEMINI_API_KEYS[0])
+
 GEMINI_MODELS = []
 for _key in GEMINI_API_KEYS:
-    genai.configure(api_key=_key)
-    GEMINI_MODELS.append(genai.GenerativeModel(MODEL_NAME))
-
-# 用第一把 key 做預設（相容舊邏輯）
-genai.configure(api_key=GEMINI_API_KEYS[0])
+    model = genai.GenerativeModel(MODEL_NAME)
+    client_opts = client_options_lib.ClientOptions(
+        api_key=_key,
+        api_endpoint="generativelanguage.googleapis.com",
+    )
+    model._client = glm.GenerativeServiceClient(client_options=client_opts)
+    model._async_client = glm.GenerativeServiceAsyncClient(client_options=client_opts)
+    GEMINI_MODELS.append(model)
+    print(f"  Key ...{_key[-4:]} 已綁定獨立 client")
 
 # Key 輪替計數器（Round-Robin）
 _model_counter = 0
 _model_lock = asyncio.Lock()
 
 async def get_next_model() -> genai.GenerativeModel:
-    """Round-Robin 取得下一個預建立的 Model（每個綁定不同 API Key）"""
+    """Round-Robin 取得下一個 Model（每個有獨立 gRPC client + API Key）"""
     global _model_counter
     async with _model_lock:
         model = GEMINI_MODELS[_model_counter % len(GEMINI_MODELS)]
