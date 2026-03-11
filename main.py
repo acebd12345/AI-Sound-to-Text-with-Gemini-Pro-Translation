@@ -4,6 +4,7 @@ import json
 import time
 import random
 import asyncio
+import opencc
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, Form, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -134,8 +135,17 @@ MAX_RETRIES = 3
 RETRY_BASE_DELAY = 2  # 秒，exponential backoff 基底
 API_TIMEOUT = 120  # 秒，單次 API 呼叫超時時間（給 Gemini 充足時間處理）
 
+# 初始化 OpenCC 轉換器 (s2twp.json 代表: 簡體轉繁體台灣，包含慣用語轉換)
+cc = opencc.OpenCC('s2twp.json')
+
 async def translate_segment_pro(srt_content, index):
     """使用 Gemini Pro 翻譯單一區塊 (SRT)，含重試與 Key 輪替"""
+    
+    # 預處理：在送給 Gemini 之前，先強制用 OpenCC 將所有的簡體字與慣用語轉為台灣繁體
+    # 這樣一來，Gemini 收到的文本就已經是繁體了，它的任務單純變成「潤飾」與「除錯」。
+    # 就算 API 徹底失敗而退回原文，出來的也會是繁體字！
+    preprocessed_srt = cc.convert(srt_content)
+
     async with GEMINI_SEMAPHORE:
         prompt = f"""You are a professional subtitle translator and Traditional Chinese localization expert.
 Task: Translate and Convert the following SRT subtitle content into Traditional Chinese (Taiwan) (繁體中文).
@@ -149,7 +159,7 @@ CRITICAL RULES:
 6. DETECT HALLUCINATIONS: If a subtitle line appears to be an ASR hallucination (e.g., repetitive nonsense, "Subscribe", "Thanks for watching", or random characters unrelated to context), replace the text with "..." or leave it blank.
 7. Do not include any explanation or markdown formatting (like ```srt). Just the raw SRT content.
 
-{srt_content}"""
+{preprocessed_srt}"""
 
         for attempt in range(MAX_RETRIES):
             model = await get_next_model()
@@ -179,7 +189,7 @@ CRITICAL RULES:
                     await asyncio.sleep(delay)
 
         print(f"⚠ 第 {index} 段翻譯全部重試失敗，回傳原文")
-        return srt_content
+        return preprocessed_srt
 
 # --- 上傳接口 (保持不變) ---
 @app.post("/upload_chunk")
