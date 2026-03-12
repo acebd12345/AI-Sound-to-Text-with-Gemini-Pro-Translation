@@ -39,10 +39,15 @@
         <!-- Mode Selection -->
         <div style="margin-bottom: 1.5rem; text-align: left;">
             <label style="font-weight: 600; color: #374151; display: block; margin-bottom: 0.5rem;">處理模式：</label>
-            <select id="processMode" style="width: 100%; padding: 0.75rem; border-radius: 0.5rem; border: 1px solid #d1d5db; background: white; font-size: 1rem;">
+            <select id="processMode" style="width: 100%; padding: 0.75rem; border-radius: 0.5rem; border: 1px solid #d1d5db; background: white; font-size: 1rem; margin-bottom: 1rem;">
                 <option value="speech">🗣️ 一般對話 / 會議 (自動過濾靜音)</option>
                 <option value="song">🎵 歌曲 / 歌詞 (保留人聲細節)</option>
             </select>
+            
+            <label style="display: flex; align-items: center; cursor: pointer; color: #374151; font-weight: 600;">
+                <input type="checkbox" id="diarizeToggle" style="width: 1.2rem; height: 1.2rem; margin-right: 0.5rem; accent-color: var(--primary);">
+                分辨講者 (Speaker Diarization)
+            </label>
         </div>
 
         <div class="upload-area">
@@ -149,6 +154,7 @@
                     fd.append("total_chunks", totalChunks);
                     fd.append("file_id", fileId);
                     fd.append("mode", mode); // 傳送模式參數
+                    fd.append("diarize", document.getElementById('diarizeToggle').checked); // 傳送區分講者設定
                     
                     await fetchWithRetry(`${API_URL}/upload_chunk`, { method: "POST", body: fd });
                 }
