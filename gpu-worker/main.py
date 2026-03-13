@@ -22,6 +22,74 @@ except Exception as e:
     print(f"模型載入失敗 (請檢查是否有 GPU 環境): {e}")
     model = None
 
+# --- pyannote 講者辨識模型 ---
+diarization_pipeline = None
+hf_token = os.environ.get("HF_TOKEN", "")
+if hf_token:
+    print("正在載入 pyannote speaker-diarization 模型...")
+    try:
+        import torch
+        from pyannote.audio import Pipeline
+        diarization_pipeline = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1",
+            token=hf_token
+        )
+        diarization_pipeline.to(torch.device("cuda"))
+        print("pyannote 模型載入完成！")
+    except Exception as e:
+        print(f"pyannote 模型載入失敗 (講者辨識將不可用): {e}")
+else:
+    print("HF_TOKEN 未設定，講者辨識功能不可用。")
+
+
+def run_diarization(audio_path):
+    """執行 pyannote 講者辨識，回傳 [(start, end, speaker), ...] 列表"""
+    if diarization_pipeline is None:
+        return []
+    output = diarization_pipeline(audio_path)
+    results = []
+    # pyannote.audio 4.x: 使用 exclusive_speaker_diarization（每個時間點只有一位講者）
+    if hasattr(output, 'speaker_diarization'):
+        for turn, speaker in output.speaker_diarization:
+            results.append((turn.start, turn.end, speaker))
+    # pyannote.audio 3.x fallback
+    elif hasattr(output, 'itertracks'):
+        for turn, _, speaker in output.itertracks(yield_label=True):
+            results.append((turn.start, turn.end, speaker))
+    else:
+        print(f"警告: 無法解析 diarization 輸出類型: {type(output).__name__}")
+    return results
+
+
+def assign_speakers_to_segments(segments, diarization_results):
+    """
+    將 pyannote 的講者標籤分配到 whisper segments。
+    比對方式：找出與 segment 時間重疊最多的 diarization turn。
+    """
+    if not diarization_results:
+        return segments
+
+    for seg in segments:
+        seg_start = seg["start"]
+        seg_end = seg["end"]
+        best_speaker = None
+        best_overlap = 0.0
+
+        for turn_start, turn_end, speaker in diarization_results:
+            # 計算重疊時間
+            overlap_start = max(seg_start, turn_start)
+            overlap_end = min(seg_end, turn_end)
+            overlap = max(0.0, overlap_end - overlap_start)
+
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_speaker = speaker
+
+        if best_speaker is not None:
+            seg["speaker"] = best_speaker
+
+    return segments
+
 storage_client = storage.Client()
 
 @app.get("/health")
@@ -95,6 +163,7 @@ async def handle_event(request: Request):
         use_vad = True
         temp = 0.2
         prompt_text = "以下是繁體中文的字幕。"
+        enable_diarize = False
 
         # 讀取 Metadata 調整參數
         try:
@@ -106,6 +175,7 @@ async def handle_event(request: Request):
                     use_vad = False
                     temp = 0
                     prompt_text = "以下是繁體中文的歌詞。"
+                enable_diarize = meta.get("diarize", False)
         except Exception as e:
             print(f"Metadata 讀取失敗 (使用預設值): {e}")
 
@@ -136,6 +206,18 @@ async def handle_event(request: Request):
                 "end": segment.end,
                 "text": segment.text
             })
+
+        # 4.5 講者辨識 (pyannote)
+        if enable_diarize and diarization_pipeline is not None:
+            print(f"執行講者辨識 (pyannote)...")
+            try:
+                diarization_results = run_diarization(local_input_path)
+                segment_list = assign_speakers_to_segments(segment_list, diarization_results)
+                print(f"講者辨識完成，共偵測到 {len(set(r[2] for r in diarization_results))} 位講者")
+            except Exception as e:
+                print(f"講者辨識失敗 (繼續不帶講者標籤): {e}")
+        elif enable_diarize:
+            print("講者辨識已啟用但 pyannote 模型未載入 (HF_TOKEN 未設定?)")
 
         # 5. 上傳結果到 GCS (transcripts 資料夾)
         # 檔名轉換: raw_audio/xyz/1 -> transcripts/xyz_part_1.json

@@ -138,21 +138,36 @@ API_TIMEOUT = 120  # 秒，單次 API 呼叫超時時間（給 Gemini 充足時�
 # 初始化 OpenCC 轉換器 (s2twp.json 代表: 簡體轉繁體台灣，包含慣用語轉換)
 cc = opencc.OpenCC('s2twp')
 
-async def translate_segment_pro(srt_content, index, diarize=False):
+async def translate_segment_pro(srt_content, index, diarize=False, known_names=""):
     """使用 Gemini Pro 翻譯單一區塊 (SRT)，含重試與 Key 輪替"""
-    
+
     # 預處理：在送給 Gemini 之前，先強制用 OpenCC 將所有的簡體字與慣用語轉為台灣繁體
     # 這樣一來，Gemini 收到的文本就已經是繁體了，它的任務單純變成「潤飾」與「除錯」。
     # 就算 API 徹底失敗而退回原文，出來的也會是繁體字！
     preprocessed_srt = cc.convert(srt_content)
-    
+
     diarize_rules = ""
     if diarize:
-        diarize_rules = """
-8. SPEAKER DIARIZATION: Your task is ALSO to identify different speakers in the transcript based on the context of the conversation. 
-   - Add a speaker label to each dialogue line, for example: `[講者 1]: 這是測試句子。` or `[講者 2]: 沒錯。`
-   - Try to maintain consistent numbering (e.g., Speaker 1 is the host, Speaker 2 is the guest) across the transcript segments based on conversation flow.
-   - If the name of the speaker is obvious from the conversation, use their name like `[王先生]: ` instead of `[講者 N]: `.
+        known_names_rule = ""
+        if known_names:
+            known_names_rule = f"""
+9. KNOWN SPEAKERS: The user has provided the following known person names: {known_names}
+   - Use these names to replace `[講者 N]` labels when you can identify the speaker from context, speech content, or how they are addressed.
+   - Format: replace `[講者 1]: text` with `[王小明]: text` if you can determine who is speaking.
+   - If you cannot confidently identify a speaker, keep the original `[講者 N]` label.
+   - Do NOT invent names that are not in the provided list.
+"""
+            diarize_rules = f"""
+8. SPEAKER LABELS: The subtitle lines may contain speaker labels like `[講者 1]: text`.
+   - Keep the bracket format for speaker labels.
+   - If a line does NOT have a speaker label, do NOT add one.
+{known_names_rule}"""
+        else:
+            diarize_rules = """
+8. SPEAKER LABELS: The subtitle lines may contain speaker labels like `[講者 1]: text`.
+   - KEEP these speaker labels EXACTLY as they are. Do NOT modify, remove, renumber, or replace them with names.
+   - Do NOT guess or infer speaker names. Always keep `[講者 N]` format unchanged.
+   - If a line does NOT have a speaker label, do NOT add one.
 """
 
     async with GEMINI_SEMAPHORE:
@@ -166,7 +181,8 @@ CRITICAL RULES:
 4. ENSURE ALL TEXT IS IN TRADITIONAL CHINESE (Taiwan). Convert any Simplified Chinese characters or foreign terms into standard Taiwan Traditional Chinese.
 5. ABSOLUTELY NO SIMPLIFIED CHINESE. You must not leave any Simplified Chinese characters (簡體字) in the output.
 6. DETECT HALLUCINATIONS: If a subtitle line appears to be an ASR hallucination (e.g., repetitive nonsense, "Subscribe", "Thanks for watching", or random characters unrelated to context), replace the text with "..." or leave it blank.
-7. Do not include any explanation or markdown formatting (like ```srt). Just the raw SRT content.{diarize_rules}
+7. Do not include any explanation or markdown formatting (like ```srt). Just the raw SRT content.
+8. PRESERVE PROPER NOUNS: Do NOT change or "correct" names of people, places, organizations, or titles based on your own knowledge. The transcript reflects what was actually spoken — keep it faithful to the original even if it contradicts your training data. Your knowledge may be outdated.{diarize_rules}
 
 {preprocessed_srt}"""
 
@@ -208,7 +224,8 @@ async def upload_chunk(
     total_chunks: int = Form(...),
     file_id: str = Form(...),
     mode: str = Form("speech"),
-    diarize: bool = Form(False)
+    diarize: bool = Form(False),
+    known_names: str = Form("")
 ):
     validate_file_id(file_id)
 
@@ -218,7 +235,7 @@ async def upload_chunk(
         # 如果是第一塊，順便儲存 metadata
         if chunk_index == 0:
             meta_blob = bucket.blob(f"raw_audio/{file_id}/metadata.json")
-            meta_data = {"mode": mode, "diarize": diarize}
+            meta_data = {"mode": mode, "diarize": diarize, "known_names": known_names}
             meta_blob.upload_from_string(json.dumps(meta_data))
 
         blob = bucket.blob(f"raw_audio/{file_id}/{chunk_index}")
@@ -322,12 +339,14 @@ async def run_translation_background(file_id, total_chunks, bucket):
         
         # 讀取 metadata 取得 diarize 設定
         diarize = False
+        known_names = ""
         try:
             meta_blob = bucket.blob(f"raw_audio/{file_id}/metadata.json")
             if meta_blob.exists():
                 meta_data = json.loads(meta_blob.download_as_text())
                 diarize = meta_data.get("diarize", False)
-                print(f"[{file_id}] Diarize 設定: {diarize}")
+                known_names = meta_data.get("known_names", "")
+                print(f"[{file_id}] Diarize 設定: {diarize}, 已知人名: {known_names or '(無)'}")
         except Exception as e:
             print(f"[{file_id}] 讀取 metadata 失敗: {e}")
 
@@ -335,20 +354,33 @@ async def run_translation_background(file_id, total_chunks, bucket):
         current_srt_index = 1
         BATCH_SIZE = 20  # 小批次翻譯，提高精準度
 
+        # 講者編號對照表：將 pyannote 的 SPEAKER_XX 統一映射為遞增編號
+        speaker_map = {}
+        speaker_counter = 1
+
         # 先預處理所有 SRT 文本
         for i, json_content in enumerate(results_json):
             data = json.loads(json_content)
             segments = data.get("segments", [])
             chunk_duration = data.get("duration", 0.0)
-            
+
             chunk_srt_lines = []
             for seg in segments:
                 start = format_timestamp(seg['start'] + current_time_offset)
                 end = format_timestamp(seg['end'] + current_time_offset)
                 text = seg['text'].strip()
+
+                # 若有講者標籤，加上 [講者 N] 前綴
+                speaker = seg.get("speaker")
+                if speaker and diarize:
+                    if speaker not in speaker_map:
+                        speaker_map[speaker] = f"講者 {speaker_counter}"
+                        speaker_counter += 1
+                    text = f"[{speaker_map[speaker]}]: {text}"
+
                 chunk_srt_lines.append(f"{current_srt_index}\n{start} --> {end}\n{text}")
                 current_srt_index += 1
-            
+
             current_time_offset += chunk_duration
             
             # 分批建立 Task
@@ -358,7 +390,7 @@ async def run_translation_background(file_id, total_chunks, bucket):
                     batch_content = "\n\n".join(batch_lines)
                     
                     # 建立 Async Task
-                    task = translate_segment_pro(batch_content, f"{i}_{k}", diarize=diarize)
+                    task = translate_segment_pro(batch_content, f"{i}_{k}", diarize=diarize, known_names=known_names)
                     translation_tasks.append(task)
                     ordered_batches.append((i, k)) # 紀錄順序
 

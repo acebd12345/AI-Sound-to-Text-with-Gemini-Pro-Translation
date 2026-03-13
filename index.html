@@ -45,9 +45,14 @@
             </select>
             
             <label style="display: flex; align-items: center; cursor: pointer; color: #374151; font-weight: 600;">
-                <input type="checkbox" id="diarizeToggle" style="width: 1.2rem; height: 1.2rem; margin-right: 0.5rem; accent-color: var(--primary);">
+                <input type="checkbox" id="diarizeToggle" onchange="toggleKnownNames()" style="width: 1.2rem; height: 1.2rem; margin-right: 0.5rem; accent-color: var(--primary);">
                 分辨講者 (Speaker Diarization)
             </label>
+            <div id="knownNamesSection" style="display: none; margin-top: 0.75rem; margin-left: 1.7rem;">
+                <label style="font-weight: 600; color: #374151; display: block; margin-bottom: 0.25rem; font-size: 0.9rem;">已知人名（供 AI 參考）：</label>
+                <input type="text" id="knownNamesInput" placeholder="例：王小明, 李大華, 張經理" style="width: 100%; padding: 0.5rem 0.75rem; border-radius: 0.5rem; border: 1px solid #d1d5db; font-size: 0.9rem; box-sizing: border-box;">
+                <div style="font-size: 0.75rem; color: #9ca3af; margin-top: 0.25rem;">以逗號分隔多個人名，AI 會嘗試用這些名字標注講者</div>
+            </div>
         </div>
 
         <div class="upload-area">
@@ -105,6 +110,11 @@
             }
         }
         
+        function toggleKnownNames() {
+            document.getElementById('knownNamesSection').style.display =
+                document.getElementById('diarizeToggle').checked ? 'block' : 'none';
+        }
+
         // 初始化載入紀錄
         document.addEventListener('DOMContentLoaded', loadHistory);
 
@@ -155,7 +165,9 @@
                     fd.append("file_id", fileId);
                     fd.append("mode", mode); // 傳送模式參數
                     fd.append("diarize", document.getElementById('diarizeToggle').checked); // 傳送區分講者設定
-                    
+                    const knownNames = document.getElementById('knownNamesInput').value.trim();
+                    if (knownNames) fd.append("known_names", knownNames);
+
                     await fetchWithRetry(`${API_URL}/upload_chunk`, { method: "POST", body: fd });
                 }
                 

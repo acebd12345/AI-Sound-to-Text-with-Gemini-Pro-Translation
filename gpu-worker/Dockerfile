@@ -20,11 +20,16 @@ RUN apt-get update && apt-get install -y \
 # faster-whisper: 核心轉錄庫
 # fastapi uvicorn: 網頁框架
 # google-cloud-storage: 操作 GCS
+# torch + pyannote.audio: 講者辨識
 RUN pip3 install --no-cache-dir \
     faster-whisper \
     fastapi \
     uvicorn \
-    google-cloud-storage
+    google-cloud-storage \
+    torch torchaudio --extra-index-url https://download.pytorch.org/whl/cu121
+
+RUN pip3 install --no-cache-dir \
+    pyannote.audio
 
 # 設定工作目錄
 WORKDIR /app
@@ -33,7 +38,9 @@ WORKDIR /app
 COPY . .
 
 # 建置時預先下載模型 (避免執行時下載失敗)
-RUN python3 download_model.py
+# ARG 放在靠近使用處，確保 build-arg 正確傳入
+ARG HF_TOKEN
+RUN HF_TOKEN="${HF_TOKEN}" python3 download_model.py
 
 # 啟動命令 (監聽 8080 端口，這是 Cloud Run 的規定)
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]

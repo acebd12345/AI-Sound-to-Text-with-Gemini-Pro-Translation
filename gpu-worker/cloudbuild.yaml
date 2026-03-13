@@ -1,0 +1,14 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '--build-arg'
+      - 'HF_TOKEN=${_HF_TOKEN}'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/gpu-worker'
+      - '.'
+images:
+  - 'gcr.io/$PROJECT_ID/gpu-worker'
+timeout: '3600s'
+options:
+  machineType: 'E2_HIGHCPU_8'
