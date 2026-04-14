@@ -515,7 +515,8 @@ async def extract_live_streams(list_url: str) -> list:
 async def get_stream_url(video_page_url: str) -> str:
     """用 yt-dlp 從影片頁面提取串流 URL"""
     proc = await asyncio.create_subprocess_exec(
-        "yt-dlp", "--get-url", "-f", "best",
+        "yt-dlp", "--get-url",
+        "--no-warnings",
         "--no-check-certificates",
         video_page_url,
         stdout=asyncio.subprocess.PIPE,
@@ -523,10 +524,11 @@ async def get_stream_url(video_page_url: str) -> str:
     )
     stdout, stderr = await proc.communicate()
     if proc.returncode == 0 and stdout.strip():
+        # 取第一行 URL（可能回傳多行，如影片+音訊分開）
         return stdout.decode().strip().split('\n')[0]
     raise HTTPException(
         status_code=400,
-        detail=f"yt-dlp 無法提取串流 URL: {stderr.decode()[:200]}"
+        detail=f"yt-dlp 無法提取串流 URL: {stderr.decode()[:300]}"
     )
 
 
