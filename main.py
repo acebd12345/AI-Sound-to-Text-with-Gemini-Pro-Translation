@@ -559,6 +559,10 @@ async def extract_live_streams(list_url: str) -> list:
 
         time_str = f"{live_btime}~{live_etime}" if live_btime else ""
 
+        # 標記串流來源類型
+        is_youtube = "youtube.com" in vdv_url or "youtu.be" in vdv_url
+        source_type = "youtube" if is_youtube else "hls"
+
         lives.append({
             "title": title,
             "url": video_page_url,
@@ -566,6 +570,7 @@ async def extract_live_streams(list_url: str) -> list:
             "vdv_url": vdv_url,
             "status": status,
             "time": time_str,
+            "source_type": source_type,
         })
 
     print(f"[爬取] 最終找到 {len(lives)} 個直播項目")
