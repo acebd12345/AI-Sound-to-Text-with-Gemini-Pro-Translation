@@ -5,16 +5,20 @@ import time
 import random
 import asyncio
 import opencc
+from urllib.parse import urljoin
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, Form, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from starlette.middleware.base import BaseHTTPMiddleware
+from pydantic import BaseModel
 from google.cloud import storage
 from google.api_core.exceptions import PreconditionFailed
 import google.generativeai as genai
 import google.ai.generativelanguage as glm
 from google.api_core import client_options as client_options_lib
+import httpx
+from bs4 import BeautifulSoup
 
 load_dotenv()
 
@@ -453,6 +457,279 @@ async def run_translation_background(file_id, total_chunks, bucket):
             bucket.blob(f"locks/{file_id}").delete()
         except Exception:
             pass
+
+# --- 直播錄製功能 ---
+
+# 活躍錄製 session（記憶體內）
+active_recordings: dict = {}
+
+# URL 白名單驗證（防止 SSRF）
+ALLOWED_STREAM_DOMAINS = [
+    "live.tcc.gov.tw",
+]
+
+def validate_stream_url(url: str) -> str:
+    """驗證串流 URL，防止 SSRF 攻擊"""
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(status_code=400, detail="僅支援 http/https URL")
+    if not parsed.hostname:
+        raise HTTPException(status_code=400, detail="無效的 URL")
+    # 允許白名單內的網域，或 m3u8/直接串流 URL
+    is_whitelisted = any(parsed.hostname.endswith(d) for d in ALLOWED_STREAM_DOMAINS)
+    is_direct_stream = any(url.lower().endswith(ext) for ext in ['.m3u8', '.mp4', '.flv', '.ts'])
+    if not is_whitelisted and not is_direct_stream:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支援的網域：{parsed.hostname}。請使用白名單內的網域或直接提供 m3u8 URL。"
+        )
+    return url
+
+
+async def extract_live_streams(list_url: str) -> list:
+    """從列表頁爬取正在直播的影片"""
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        resp = await client.get(list_url)
+        resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    lives = []
+    # 找所有連結到 VideoData.aspx 的卡片
+    for card in soup.select("a[href*='VideoData.aspx']"):
+        text_content = card.get_text(separator=" ", strip=True)
+        # 只取有 LIVE 標記的
+        if "LIVE" not in text_content.upper():
+            continue
+        href = card.get("href", "")
+        if not href:
+            continue
+        # 取標題（第一個 h6 或整段文字）
+        h6 = card.select_one("h6")
+        title = h6.get_text(strip=True) if h6 else text_content[:50]
+        full_url = urljoin(list_url, href)
+        lives.append({"title": title, "url": full_url})
+    return lives
+
+
+async def get_stream_url(video_page_url: str) -> str:
+    """用 yt-dlp 從影片頁面提取串流 URL"""
+    proc = await asyncio.create_subprocess_exec(
+        "yt-dlp", "--get-url", "-f", "best",
+        "--no-check-certificates",
+        video_page_url,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode == 0 and stdout.strip():
+        return stdout.decode().strip().split('\n')[0]
+    raise HTTPException(
+        status_code=400,
+        detail=f"yt-dlp 無法提取串流 URL: {stderr.decode()[:200]}"
+    )
+
+
+class FindStreamsRequest(BaseModel):
+    list_url: str
+
+class StartRecordingRequest(BaseModel):
+    stream_url: str
+    title: str = ""
+    mode: str = "speech"
+    diarize: bool = False
+    known_names: str = ""
+
+
+@app.post("/find_live_streams")
+async def find_live_streams(req: FindStreamsRequest):
+    """搜尋列表頁中正在直播的影片"""
+    validate_stream_url(req.list_url)
+    try:
+        streams = await extract_live_streams(req.list_url)
+        return {"streams": streams}
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"無法存取列表頁: {e}")
+
+
+@app.post("/start_recording")
+async def start_recording(req: StartRecordingRequest, background_tasks: BackgroundTasks):
+    """開始錄製串流（每 30 分鐘切一段自動處理）"""
+    stream_url = req.stream_url
+
+    # 判斷 URL 類型：如果是影片頁面（非直接串流），先用 yt-dlp 提取
+    is_direct_stream = any(stream_url.lower().endswith(ext) for ext in ['.m3u8', '.mp4', '.flv', '.ts'])
+    if not is_direct_stream and 'VideoData.aspx' in stream_url:
+        validate_stream_url(stream_url)
+        stream_url = await get_stream_url(stream_url)
+    elif not is_direct_stream:
+        # 嘗試用 yt-dlp 提取
+        validate_stream_url(stream_url)
+        stream_url = await get_stream_url(stream_url)
+
+    # 驗證 ffmpeg 能否連上串流
+    probe_proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-i", stream_url, "-t", "1", "-f", "null", "-",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    _, probe_stderr = await asyncio.wait_for(probe_proc.communicate(), timeout=15)
+    # ffmpeg 探測失敗不一定 returncode != 0，檢查 stderr 中是否有嚴重錯誤
+    probe_output = probe_stderr.decode()
+    if "Server returned" in probe_output and "404" in probe_output:
+        raise HTTPException(status_code=400, detail="串流 URL 無效 (404)")
+    if "Connection refused" in probe_output:
+        raise HTTPException(status_code=400, detail="無法連線到串流伺服器")
+
+    suffix = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=6))
+    session_id = f"rec_{int(time.time())}_{suffix}"
+
+    active_recordings[session_id] = {
+        "status": "recording",
+        "stream_url": stream_url,
+        "title": req.title or "直播錄製",
+        "mode": req.mode,
+        "diarize": req.diarize,
+        "known_names": req.known_names,
+        "segments": [],
+        "stop": False,
+        "started_at": time.time(),
+        "error": None,
+    }
+
+    background_tasks.add_task(
+        recording_loop, session_id, stream_url,
+        req.mode, req.diarize, req.known_names
+    )
+
+    return {
+        "status": "recording_started",
+        "session_id": session_id,
+        "stream_url": stream_url,
+    }
+
+
+@app.post("/stop_recording/{session_id}")
+async def stop_recording(session_id: str):
+    """停止錄製"""
+    rec = active_recordings.get(session_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="錄製 session 不存在")
+    if rec["status"] != "recording":
+        return {"status": rec["status"], "message": "錄製已結束"}
+
+    rec["stop"] = True
+    # 嘗試終止正在執行的 ffmpeg
+    ffmpeg_proc = rec.get("_ffmpeg_proc")
+    if ffmpeg_proc and ffmpeg_proc.returncode is None:
+        try:
+            ffmpeg_proc.terminate()
+        except Exception:
+            pass
+
+    return {"status": "stopping", "message": "正在停止，等待當前片段完成..."}
+
+
+@app.get("/recording_status/{session_id}")
+async def recording_status(session_id: str):
+    """查詢錄製狀態"""
+    rec = active_recordings.get(session_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="錄製 session 不存在")
+
+    elapsed = time.time() - rec["started_at"]
+    return {
+        "status": rec["status"],
+        "title": rec["title"],
+        "elapsed_seconds": int(elapsed),
+        "segments": rec["segments"],
+        "error": rec.get("error"),
+    }
+
+
+SEGMENT_DURATION = 1800  # 30 分鐘
+
+async def recording_loop(session_id, stream_url, mode, diarize, known_names):
+    """背景任務：持續錄製串流，每 30 分鐘切一段上傳"""
+    rec = active_recordings[session_id]
+    segment_num = 0
+    bucket = storage_client.bucket(BUCKET_NAME)
+
+    try:
+        while not rec["stop"]:
+            file_id = f"{session_id}_seg{segment_num}"
+            local_path = f"/tmp/{file_id}.wav"
+
+            print(f"[錄製] {session_id} 開始錄製第 {segment_num} 段...")
+
+            # ffmpeg 錄製 30 分鐘（-vn 去影片，轉 16kHz mono WAV 給 Whisper）
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y",
+                "-i", stream_url,
+                "-t", str(SEGMENT_DURATION),
+                "-vn",
+                "-acodec", "pcm_s16le",
+                "-ar", "16000",
+                "-ac", "1",
+                local_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            rec["_ffmpeg_proc"] = proc
+
+            try:
+                _, stderr_data = await proc.communicate()
+            except Exception as e:
+                print(f"[錄製] {session_id} ffmpeg 異常: {e}")
+                break
+
+            # 檢查是否產生了有效的音檔
+            if not os.path.exists(local_path) or os.path.getsize(local_path) < 1024:
+                print(f"[錄製] {session_id} 第 {segment_num} 段錄製失敗或檔案過小")
+                if os.path.exists(local_path):
+                    os.remove(local_path)
+                # 串流可能已結束
+                rec["error"] = "串流已結束或錄製失敗"
+                break
+
+            print(f"[錄製] {session_id} 第 {segment_num} 段錄製完成，上傳至 GCS...")
+
+            # 上傳 metadata
+            loop = asyncio.get_running_loop()
+            meta_blob = bucket.blob(f"raw_audio/{file_id}/metadata.json")
+            meta_content = json.dumps({"mode": mode, "diarize": diarize, "known_names": known_names})
+            await loop.run_in_executor(None, meta_blob.upload_from_string, meta_content)
+
+            # 上傳音檔（作為 chunk 0）
+            audio_blob = bucket.blob(f"raw_audio/{file_id}/0")
+            await loop.run_in_executor(None, audio_blob.upload_from_filename, local_path)
+
+            # 清理暫存檔
+            os.remove(local_path)
+
+            # 記錄片段
+            rec["segments"].append({
+                "file_id": file_id,
+                "total_chunks": 1,
+                "segment_num": segment_num,
+                "status": "uploaded",
+            })
+            print(f"[錄製] {session_id} 第 {segment_num} 段已上傳 (file_id={file_id})")
+
+            segment_num += 1
+
+            # 如果 ffmpeg 被 terminate 了（用戶按停止），不繼續
+            if rec["stop"]:
+                break
+
+    except Exception as e:
+        print(f"[錄製] {session_id} 錄製迴圈錯誤: {e}")
+        rec["error"] = str(e)
+    finally:
+        rec["status"] = "stopped"
+        rec.pop("_ffmpeg_proc", None)
+        print(f"[錄製] {session_id} 錄製結束，共 {len(rec['segments'])} 段")
+
 
 if __name__ == "__main__":
     import uvicorn

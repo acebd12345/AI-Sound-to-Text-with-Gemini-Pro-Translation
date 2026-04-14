@@ -2,8 +2,8 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# 安裝系統依賴 (如果需要)
-# RUN apt-get update && apt-get install -y ...
+# 安裝系統依賴
+RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 
 # 複製需求檔
 COPY requirements.txt .
