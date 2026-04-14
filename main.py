@@ -582,7 +582,7 @@ async def get_stream_url(video_page_url: str) -> str:
         vdvno = parse_qs(parsed.query).get("vdvno", [""])[0]
         if vdvno:
             api_base = get_api_base(video_page_url)
-            video_api = f"{api_base}SPW010_VideoData?vdvno={vdvno}"
+            video_api = f"{api_base}SPW010_VideoData?vdv_vdvno={vdvno}"
             print(f"[串流提取] 呼叫 API: {video_api}")
             try:
                 async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
@@ -592,6 +592,9 @@ async def get_stream_url(video_page_url: str) -> str:
                     })
                     resp.raise_for_status()
                 data = resp.json()
+                # API 可能回傳 array
+                if isinstance(data, list) and data:
+                    data = data[0]
                 # 優先用 VideoURLList（多畫質）
                 url_list = data.get("VideoURLList", [])
                 if url_list:
