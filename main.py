@@ -601,16 +601,26 @@ async def get_stream_url(video_page_url: str) -> str:
                     stream = url_list[0].get("src", "") if isinstance(url_list[0], dict) else str(url_list[0])
                     if stream:
                         print(f"[串流提取] 從 VideoURLList 取得: {stream}")
+                        # YouTube URL 需要 yt-dlp 轉換
+                        if "youtube.com" in stream or "youtu.be" in stream:
+                            return await _ytdlp_extract(stream)
                         return stream
                 # 其次用 vdv_url
                 vdv_url = data.get("vdv_url", "")
                 if vdv_url:
                     print(f"[串流提取] 從 vdv_url 取得: {vdv_url}")
+                    # YouTube URL 需要 yt-dlp 轉換
+                    if "youtube.com" in vdv_url or "youtu.be" in vdv_url:
+                        return await _ytdlp_extract(vdv_url)
                     return vdv_url
             except Exception as e:
                 print(f"[串流提取] iShare API 失敗: {e}")
 
-    # 方法 2: 爬網頁找 m3u8
+    # 方法 2: 如果是 YouTube URL，直接用 yt-dlp
+    if "youtube.com" in video_page_url or "youtu.be" in video_page_url:
+        return await _ytdlp_extract(video_page_url)
+
+    # 方法 3: 爬網頁找 m3u8
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             resp = await client.get(video_page_url)
@@ -623,23 +633,37 @@ async def get_stream_url(video_page_url: str) -> str:
     except Exception as e:
         print(f"[串流提取] 網頁爬取失敗: {e}")
 
-    # 方法 3: yt-dlp（適用於 YouTube 等平台）
+    # 方法 4: yt-dlp 通用 fallback
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "yt-dlp", "--get-url", "--no-warnings", "--no-check-certificates",
-            video_page_url,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-        if proc.returncode == 0 and stdout.strip():
-            return stdout.decode().strip().split('\n')[0]
-    except Exception as e:
-        print(f"[串流提取] yt-dlp 失敗: {e}")
+        return await _ytdlp_extract(video_page_url)
+    except Exception:
+        pass
 
     raise HTTPException(
         status_code=400,
         detail="無法自動提取串流 URL。請從瀏覽器 F12 → Network 找到 .m3u8 網址，使用「直接錄製」。"
     )
+
+
+async def _ytdlp_extract(url: str) -> str:
+    """用 yt-dlp 從 URL 提取串流（支援 YouTube 等平台）"""
+    print(f"[yt-dlp] 提取串流: {url}")
+    proc = await asyncio.create_subprocess_exec(
+        "yt-dlp", "--get-url",
+        "--no-warnings", "--no-check-certificates",
+        "-f", "bestaudio/best",
+        url,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+    if proc.returncode == 0 and stdout.strip():
+        result = stdout.decode().strip().split('\n')[0]
+        print(f"[yt-dlp] 提取成功: {result[:100]}...")
+        return result
+    err = stderr.decode()[:300] if stderr else "unknown error"
+    print(f"[yt-dlp] 提取失敗: {err}")
+    raise HTTPException(status_code=400, detail=f"yt-dlp 無法提取串流: {err}")
 
 
 class FindStreamsRequest(BaseModel):
