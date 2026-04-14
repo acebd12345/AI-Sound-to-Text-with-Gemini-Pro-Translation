@@ -487,124 +487,143 @@ def validate_stream_url(url: str) -> str:
     return url
 
 
-DEMO_KEYWORDS = ["ted演講", "ted talks", "popular_video"]
+# --- iShare Portal API 整合 ---
+# 從列表頁 URL 推導 API base URL
+# 例：https://live.tcc.gov.tw/iSharePortalWeb/User/VideoList.aspx?category=3
+#   → https://live.tcc.gov.tw/iSharePortalWeb/api/
+
+def get_api_base(page_url: str) -> str:
+    """從 iShare Portal 頁面 URL 推導 API base URL"""
+    from urllib.parse import urlparse
+    parsed = urlparse(page_url)
+    # 找 /User/ 或 /iSharePortalWeb/ 路徑
+    path = parsed.path
+    if "/User/" in path:
+        base_path = path[:path.index("/User/")] + "/api/"
+    elif "/iSharePortalWeb/" in path:
+        base_path = path[:path.index("/iSharePortalWeb/") + len("/iSharePortalWeb/")] + "api/"
+    else:
+        base_path = "/iSharePortalWeb/api/"
+    return f"{parsed.scheme}://{parsed.netloc}{base_path}"
+
 
 async def extract_live_streams(list_url: str) -> list:
-    """從列表頁爬取正在直播的影片（支援 iShare Portal 結構）"""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
-    }
+    """透過 iShare Portal API 取得正在直播的影片列表"""
+    api_base = get_api_base(list_url)
+    live_api = f"{api_base}SPW024_VideoLive"
+    print(f"[爬取] 呼叫直播 API: {live_api}")
+
     async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-        resp = await client.get(list_url, headers=headers)
+        resp = await client.get(live_api, headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": list_url,
+        })
         resp.raise_for_status()
 
-    html = resp.text
-    print(f"[爬取] 列表頁回應長度: {len(html)} 字元")
+    data = resp.json()
+    print(f"[爬取] API 回傳 {len(data)} 筆直播資料")
 
-    # 記錄 HTML 前 2000 字供除錯
-    print(f"[爬取] HTML 片段: {html[:2000]}")
-
-    soup = BeautifulSoup(html, "html.parser")
     lives = []
+    from datetime import datetime
+    now = datetime.now()
 
-    # --- 策略 1: iShare Portal 結構 ---
-    # 找「直播中」標記 (class 含 btn_VideoData_live 或文字為「直播中」)
-    live_badges = soup.find_all(
-        lambda tag: tag.name in ("div", "span") and (
-            "btn_VideoData_live" in " ".join(tag.get("class", [])) or
-            "直播中" in tag.get_text(strip=True)
-        )
-    )
-    print(f"[爬取] 找到 {len(live_badges)} 個「直播中」標記")
+    for item in data:
+        title = item.get("vdv_title", "") or item.get("vdt_title", "")
+        vdvno = item.get("vdv_vdvno", "")
+        vdv_url = item.get("vdv_url", "")
+        live_date = item.get("LiveDate", "")
+        live_btime = item.get("LiveBTime", "")
+        live_etime = item.get("LiveETime", "")
 
-    for badge in live_badges:
-        # 往上找最近的 <a> 父元素
-        parent_link = badge.find_parent("a")
-        if not parent_link:
-            # 也可能是同層的兄弟元素
-            container = badge.find_parent(["div", "li", "td"])
-            if container:
-                parent_link = container.find("a", href=True)
-        if not parent_link:
+        if not vdvno:
             continue
 
-        href = parent_link.get("href", "")
+        # 判斷是否正在直播
+        status = "unknown"
+        try:
+            start_dt = datetime.strptime(f"{live_date} {live_btime}", "%Y/%m/%d %H:%M")
+            end_dt = datetime.strptime(f"{live_date} {live_etime}", "%Y/%m/%d %H:%M")
+            if now < start_dt:
+                status = "upcoming"
+            elif now > end_dt:
+                status = "ended"
+            else:
+                status = "live"
+        except Exception:
+            status = "live"  # 無法判斷就當作直播中
 
-        # 找標題 (p.popular_video_txt_big 或 h6 或任何有內容的文字)
-        title_el = parent_link.find("p", class_=lambda c: c and "popular_video_txt_big" in c)
-        if not title_el:
-            title_el = parent_link.find(["h6", "h5", "h4", "p"])
-        title = title_el.get_text(strip=True) if title_el else parent_link.get_text(strip=True)[:80]
+        # 建構 VideoData 頁面 URL
+        video_page_url = urljoin(list_url, f"VideoData.aspx?vdvno={vdvno}")
 
-        if not title or not href:
-            continue
-        # 過濾示範內容
-        combined = (title + " " + href).lower()
-        if any(kw in combined for kw in DEMO_KEYWORDS):
-            continue
+        time_str = f"{live_btime}~{live_etime}" if live_btime else ""
 
-        full_url = urljoin(list_url, href)
-        lives.append({"title": title, "url": full_url})
-
-    # --- 策略 2: 通用 fallback（找含 LIVE 的 VideoData 連結）---
-    if not lives:
-        for card in soup.select("a[href*='VideoData.aspx']"):
-            text_content = card.get_text(separator=" ", strip=True)
-            href = card.get("href", "")
-            if not href:
-                continue
-            # 過濾示範內容
-            combined = (text_content + " " + href).lower()
-            if any(kw in combined for kw in DEMO_KEYWORDS):
-                continue
-            # 需要有 LIVE 或 直播 標記
-            if "LIVE" not in text_content.upper() and "直播" not in text_content:
-                continue
-            h6 = card.select_one("h6")
-            title = h6.get_text(strip=True) if h6 else text_content[:80]
-            full_url = urljoin(list_url, href)
-            lives.append({"title": title, "url": full_url})
+        lives.append({
+            "title": title,
+            "url": video_page_url,
+            "vdvno": vdvno,
+            "vdv_url": vdv_url,
+            "status": status,
+            "time": time_str,
+        })
 
     print(f"[爬取] 最終找到 {len(lives)} 個直播項目")
     return lives
 
 
 async def get_stream_url(video_page_url: str) -> str:
-    """從影片頁面提取串流 URL（先嘗試爬網頁找 m3u8，再試 yt-dlp）"""
+    """從 iShare Portal 影片頁面提取串流 URL"""
+    from urllib.parse import urlparse, parse_qs
 
-    # 方法 1: 直接爬網頁找 m3u8 / rtmp / mp4 串流 URL
+    # 方法 1: 如果是 iShare VideoData 頁面，呼叫 SPW010 API 取得串流 URL
+    if "VideoData.aspx" in video_page_url and "vdvno=" in video_page_url:
+        parsed = urlparse(video_page_url)
+        vdvno = parse_qs(parsed.query).get("vdvno", [""])[0]
+        if vdvno:
+            api_base = get_api_base(video_page_url)
+            video_api = f"{api_base}SPW010_VideoData?vdvno={vdvno}"
+            print(f"[串流提取] 呼叫 API: {video_api}")
+            try:
+                async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+                    resp = await client.get(video_api, headers={
+                        "User-Agent": "Mozilla/5.0",
+                        "Referer": video_page_url,
+                    })
+                    resp.raise_for_status()
+                data = resp.json()
+                # 優先用 VideoURLList（多畫質）
+                url_list = data.get("VideoURLList", [])
+                if url_list:
+                    stream = url_list[0].get("src", "") if isinstance(url_list[0], dict) else str(url_list[0])
+                    if stream:
+                        print(f"[串流提取] 從 VideoURLList 取得: {stream}")
+                        return stream
+                # 其次用 vdv_url
+                vdv_url = data.get("vdv_url", "")
+                if vdv_url:
+                    print(f"[串流提取] 從 vdv_url 取得: {vdv_url}")
+                    return vdv_url
+            except Exception as e:
+                print(f"[串流提取] iShare API 失敗: {e}")
+
+    # 方法 2: 爬網頁找 m3u8
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             resp = await client.get(video_page_url)
             resp.raise_for_status()
         page_text = resp.text
-        # 在 HTML / JS 中搜尋串流 URL
-        m3u8_pattern = re.compile(r'(https?://[^\s\'"<>]+\.m3u8[^\s\'"<>]*)', re.IGNORECASE)
-        mp4_pattern = re.compile(r'(https?://[^\s\'"<>]+\.mp4[^\s\'"<>]*)', re.IGNORECASE)
-        rtmp_pattern = re.compile(r'(rtmp://[^\s\'"<>]+)', re.IGNORECASE)
-        # 也搜尋常見的 iShare 串流 API pattern
-        stream_api_pattern = re.compile(r'(https?://[^\s\'"<>]*(?:stream|live|hls|playlist)[^\s\'"<>]*)', re.IGNORECASE)
-
-        for pattern in [m3u8_pattern, mp4_pattern, rtmp_pattern, stream_api_pattern]:
-            matches = pattern.findall(page_text)
-            if matches:
-                stream_url = matches[0]
-                print(f"[串流提取] 從網頁找到串流 URL: {stream_url}")
-                return stream_url
+        m3u8_matches = re.findall(r'(https?://[^\s\'"<>]+\.m3u8[^\s\'"<>]*)', page_text, re.IGNORECASE)
+        if m3u8_matches:
+            print(f"[串流提取] 從 HTML 找到 m3u8: {m3u8_matches[0]}")
+            return m3u8_matches[0]
     except Exception as e:
         print(f"[串流提取] 網頁爬取失敗: {e}")
 
-    # 方法 2: 嘗試 yt-dlp
+    # 方法 3: yt-dlp（適用於 YouTube 等平台）
     try:
         proc = await asyncio.create_subprocess_exec(
-            "yt-dlp", "--get-url",
-            "--no-warnings",
-            "--no-check-certificates",
+            "yt-dlp", "--get-url", "--no-warnings", "--no-check-certificates",
             video_page_url,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
         if proc.returncode == 0 and stdout.strip():
@@ -614,7 +633,7 @@ async def get_stream_url(video_page_url: str) -> str:
 
     raise HTTPException(
         status_code=400,
-        detail="無法自動提取串流 URL。請從瀏覽器 F12 → Network 找到 .m3u8 網址，直接貼上使用「直接錄製」。"
+        detail="無法自動提取串流 URL。請從瀏覽器 F12 → Network 找到 .m3u8 網址，使用「直接錄製」。"
     )
 
 

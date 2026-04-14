@@ -488,17 +488,22 @@
                     streams.forEach((s, i) => {
                         const div = document.createElement('div');
                         div.className = 'stream-item';
+                        const statusText = s.status === 'live' ? '<span style="color:#ef4444;font-weight:700;">直播中</span>' :
+                                           s.status === 'upcoming' ? '<span style="color:#f59e0b;">尚未開始</span>' :
+                                           s.status === 'ended' ? '<span style="color:#6b7280;">已結束</span>' : '';
+                        const timeText = s.time ? `<span style="color:#6b7280;"> (${escapeHtml(s.time)})</span>` : '';
                         div.innerHTML = `
                             <input type="radio" name="stream" value="${i}" id="stream_${i}">
                             <label for="stream_${i}" style="flex: 1; cursor: pointer;">
                                 <div style="font-weight: 600;">${escapeHtml(s.title)}</div>
-                                <div style="font-size: 0.75rem; color: #6b7280; word-break: break-all;">${escapeHtml(s.url)}</div>
+                                <div style="font-size: 0.8rem;">${statusText}${timeText}</div>
                             </label>
                         `;
                         div.onclick = () => {
                             document.getElementById(`stream_${i}`).checked = true;
                             document.querySelectorAll('.stream-item').forEach(el => el.classList.remove('selected'));
                             div.classList.add('selected');
+                            // 優先用影片頁 URL（後端會透過 API 提取串流）
                             selectedStreamUrl = s.url;
                             selectedStreamTitle = s.title;
                             document.getElementById('startRecSelectedBtn').disabled = false;
