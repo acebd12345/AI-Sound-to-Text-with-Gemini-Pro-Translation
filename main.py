@@ -513,22 +513,49 @@ async def extract_live_streams(list_url: str) -> list:
 
 
 async def get_stream_url(video_page_url: str) -> str:
-    """用 yt-dlp 從影片頁面提取串流 URL"""
-    proc = await asyncio.create_subprocess_exec(
-        "yt-dlp", "--get-url",
-        "--no-warnings",
-        "--no-check-certificates",
-        video_page_url,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode == 0 and stdout.strip():
-        # 取第一行 URL（可能回傳多行，如影片+音訊分開）
-        return stdout.decode().strip().split('\n')[0]
+    """從影片頁面提取串流 URL（先嘗試爬網頁找 m3u8，再試 yt-dlp）"""
+
+    # 方法 1: 直接爬網頁找 m3u8 / rtmp / mp4 串流 URL
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            resp = await client.get(video_page_url)
+            resp.raise_for_status()
+        page_text = resp.text
+        # 在 HTML / JS 中搜尋串流 URL
+        m3u8_pattern = re.compile(r'(https?://[^\s\'"<>]+\.m3u8[^\s\'"<>]*)', re.IGNORECASE)
+        mp4_pattern = re.compile(r'(https?://[^\s\'"<>]+\.mp4[^\s\'"<>]*)', re.IGNORECASE)
+        rtmp_pattern = re.compile(r'(rtmp://[^\s\'"<>]+)', re.IGNORECASE)
+        # 也搜尋常見的 iShare 串流 API pattern
+        stream_api_pattern = re.compile(r'(https?://[^\s\'"<>]*(?:stream|live|hls|playlist)[^\s\'"<>]*)', re.IGNORECASE)
+
+        for pattern in [m3u8_pattern, mp4_pattern, rtmp_pattern, stream_api_pattern]:
+            matches = pattern.findall(page_text)
+            if matches:
+                stream_url = matches[0]
+                print(f"[串流提取] 從網頁找到串流 URL: {stream_url}")
+                return stream_url
+    except Exception as e:
+        print(f"[串流提取] 網頁爬取失敗: {e}")
+
+    # 方法 2: 嘗試 yt-dlp
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "yt-dlp", "--get-url",
+            "--no-warnings",
+            "--no-check-certificates",
+            video_page_url,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        if proc.returncode == 0 and stdout.strip():
+            return stdout.decode().strip().split('\n')[0]
+    except Exception as e:
+        print(f"[串流提取] yt-dlp 失敗: {e}")
+
     raise HTTPException(
         status_code=400,
-        detail=f"yt-dlp 無法提取串流 URL: {stderr.decode()[:300]}"
+        detail="無法自動提取串流 URL。請從瀏覽器 F12 → Network 找到 .m3u8 網址，直接貼上使用「直接錄製」。"
     )
 
 
