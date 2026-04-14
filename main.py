@@ -524,8 +524,10 @@ async def extract_live_streams(list_url: str) -> list:
     print(f"[爬取] API 回傳 {len(data)} 筆直播資料")
 
     lives = []
-    from datetime import datetime
-    now = datetime.now()
+    from datetime import datetime, timezone, timedelta
+    # 直播時間是台灣時間 (UTC+8)
+    tw_tz = timezone(timedelta(hours=8))
+    now = datetime.now(tw_tz).replace(tzinfo=None)
 
     for item in data:
         title = item.get("vdv_title", "") or item.get("vdt_title", "")
