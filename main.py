@@ -598,17 +598,22 @@ async def start_recording(req: StartRecordingRequest, background_tasks: Backgrou
 
     # 驗證 ffmpeg 能否連上串流
     probe_proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-i", stream_url, "-t", "1", "-f", "null", "-",
+        "ffmpeg",
+        "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "-headers", f"Referer: {stream_url}\r\n",
+        "-i", stream_url, "-t", "2", "-f", "null", "-",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE
     )
-    _, probe_stderr = await asyncio.wait_for(probe_proc.communicate(), timeout=15)
-    # ffmpeg 探測失敗不一定 returncode != 0，檢查 stderr 中是否有嚴重錯誤
-    probe_output = probe_stderr.decode()
+    _, probe_stderr = await asyncio.wait_for(probe_proc.communicate(), timeout=20)
+    probe_output = probe_stderr.decode(errors='replace')
+    print(f"[串流探測] ffmpeg probe 輸出 (末 300 字): {probe_output[-300:]}")
     if "Server returned" in probe_output and "404" in probe_output:
         raise HTTPException(status_code=400, detail="串流 URL 無效 (404)")
     if "Connection refused" in probe_output:
         raise HTTPException(status_code=400, detail="無法連線到串流伺服器")
+    if "Invalid data found" in probe_output and "Output" not in probe_output:
+        raise HTTPException(status_code=400, detail=f"串流格式無法辨識: {probe_output[-200:]}")
 
     suffix = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=6))
     session_id = f"rec_{int(time.time())}_{suffix}"
@@ -692,8 +697,11 @@ async def recording_loop(session_id, stream_url, mode, diarize, known_names):
             print(f"[錄製] {session_id} 開始錄製第 {segment_num} 段...")
 
             # ffmpeg 錄製 30 分鐘（-vn 去影片，轉 16kHz mono WAV 給 Whisper）
+            # 加上 headers 以支援需要 Referer 的串流平台
             proc = await asyncio.create_subprocess_exec(
                 "ffmpeg", "-y",
+                "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "-headers", f"Referer: {stream_url}\r\n",
                 "-i", stream_url,
                 "-t", str(SEGMENT_DURATION),
                 "-vn",
@@ -708,17 +716,19 @@ async def recording_loop(session_id, stream_url, mode, diarize, known_names):
 
             try:
                 _, stderr_data = await proc.communicate()
+                ffmpeg_log = stderr_data.decode(errors='replace')[-500:]
+                print(f"[錄製] {session_id} ffmpeg 輸出 (末 500 字): {ffmpeg_log}")
             except Exception as e:
                 print(f"[錄製] {session_id} ffmpeg 異常: {e}")
                 break
 
-            # 檢查是否產生了有效的音檔
-            if not os.path.exists(local_path) or os.path.getsize(local_path) < 1024:
-                print(f"[錄製] {session_id} 第 {segment_num} 段錄製失敗或檔案過小")
+            # 檢查是否產生了有效的音檔（至少 10KB，避免空檔）
+            file_size = os.path.getsize(local_path) if os.path.exists(local_path) else 0
+            if file_size < 10240:
+                print(f"[錄製] {session_id} 第 {segment_num} 段錄製失敗或檔案過小 ({file_size} bytes)")
                 if os.path.exists(local_path):
                     os.remove(local_path)
-                # 串流可能已結束
-                rec["error"] = "串流已結束或錄製失敗"
+                rec["error"] = f"串流已結束或錄製失敗（檔案 {file_size} bytes）"
                 break
 
             print(f"[錄製] {session_id} 第 {segment_num} 段錄製完成，上傳至 GCS...")
