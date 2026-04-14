@@ -487,40 +487,87 @@ def validate_stream_url(url: str) -> str:
     return url
 
 
-DEMO_KEYWORDS = ["ted", "ted演講", "ted talks", "popular_video"]
+DEMO_KEYWORDS = ["ted演講", "ted talks", "popular_video"]
 
 async def extract_live_streams(list_url: str) -> list:
-    """從列表頁爬取正在直播的影片（過濾示範內容）"""
+    """從列表頁爬取正在直播的影片（支援 iShare Portal 結構）"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+    }
     async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-        resp = await client.get(list_url)
+        resp = await client.get(list_url, headers=headers)
         resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
 
+    html = resp.text
+    print(f"[爬取] 列表頁回應長度: {len(html)} 字元")
+
+    # 記錄 HTML 前 2000 字供除錯
+    print(f"[爬取] HTML 片段: {html[:2000]}")
+
+    soup = BeautifulSoup(html, "html.parser")
     lives = []
-    # 找所有連結到 VideoData.aspx 的卡片
-    for card in soup.select("a[href*='VideoData.aspx']"):
-        text_content = card.get_text(separator=" ", strip=True)
-        # 只取有 LIVE 標記的
-        if "LIVE" not in text_content.upper():
-            continue
-        href = card.get("href", "")
-        if not href:
+
+    # --- 策略 1: iShare Portal 結構 ---
+    # 找「直播中」標記 (class 含 btn_VideoData_live 或文字為「直播中」)
+    live_badges = soup.find_all(
+        lambda tag: tag.name in ("div", "span") and (
+            "btn_VideoData_live" in " ".join(tag.get("class", [])) or
+            "直播中" in tag.get_text(strip=True)
+        )
+    )
+    print(f"[爬取] 找到 {len(live_badges)} 個「直播中」標記")
+
+    for badge in live_badges:
+        # 往上找最近的 <a> 父元素
+        parent_link = badge.find_parent("a")
+        if not parent_link:
+            # 也可能是同層的兄弟元素
+            container = badge.find_parent(["div", "li", "td"])
+            if container:
+                parent_link = container.find("a", href=True)
+        if not parent_link:
             continue
 
-        # 取標題
-        h6 = card.select_one("h6")
-        title = h6.get_text(strip=True) if h6 else text_content[:50]
-        full_url = urljoin(list_url, href)
+        href = parent_link.get("href", "")
 
-        # 過濾示範/預設內容（TED 演講等）
-        combined = (title + " " + text_content + " " + href).lower()
+        # 找標題 (p.popular_video_txt_big 或 h6 或任何有內容的文字)
+        title_el = parent_link.find("p", class_=lambda c: c and "popular_video_txt_big" in c)
+        if not title_el:
+            title_el = parent_link.find(["h6", "h5", "h4", "p"])
+        title = title_el.get_text(strip=True) if title_el else parent_link.get_text(strip=True)[:80]
+
+        if not title or not href:
+            continue
+        # 過濾示範內容
+        combined = (title + " " + href).lower()
         if any(kw in combined for kw in DEMO_KEYWORDS):
             continue
-        # 過濾沒有 vdvno 參數的連結（可能是平台佔位符）
-        if "vdvno=" not in href.lower():
-            continue
 
+        full_url = urljoin(list_url, href)
         lives.append({"title": title, "url": full_url})
+
+    # --- 策略 2: 通用 fallback（找含 LIVE 的 VideoData 連結）---
+    if not lives:
+        for card in soup.select("a[href*='VideoData.aspx']"):
+            text_content = card.get_text(separator=" ", strip=True)
+            href = card.get("href", "")
+            if not href:
+                continue
+            # 過濾示範內容
+            combined = (text_content + " " + href).lower()
+            if any(kw in combined for kw in DEMO_KEYWORDS):
+                continue
+            # 需要有 LIVE 或 直播 標記
+            if "LIVE" not in text_content.upper() and "直播" not in text_content:
+                continue
+            h6 = card.select_one("h6")
+            title = h6.get_text(strip=True) if h6 else text_content[:80]
+            full_url = urljoin(list_url, href)
+            lives.append({"title": title, "url": full_url})
+
+    print(f"[爬取] 最終找到 {len(lives)} 個直播項目")
     return lives
 
 
