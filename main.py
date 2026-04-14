@@ -487,8 +487,10 @@ def validate_stream_url(url: str) -> str:
     return url
 
 
+DEMO_KEYWORDS = ["ted", "ted演講", "ted talks", "popular_video"]
+
 async def extract_live_streams(list_url: str) -> list:
-    """從列表頁爬取正在直播的影片"""
+    """從列表頁爬取正在直播的影片（過濾示範內容）"""
     async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
         resp = await client.get(list_url)
         resp.raise_for_status()
@@ -504,10 +506,20 @@ async def extract_live_streams(list_url: str) -> list:
         href = card.get("href", "")
         if not href:
             continue
-        # 取標題（第一個 h6 或整段文字）
+
+        # 取標題
         h6 = card.select_one("h6")
         title = h6.get_text(strip=True) if h6 else text_content[:50]
         full_url = urljoin(list_url, href)
+
+        # 過濾示範/預設內容（TED 演講等）
+        combined = (title + " " + text_content + " " + href).lower()
+        if any(kw in combined for kw in DEMO_KEYWORDS):
+            continue
+        # 過濾沒有 vdvno 參數的連結（可能是平台佔位符）
+        if "vdvno=" not in href.lower():
+            continue
+
         lives.append({"title": title, "url": full_url})
     return lives
 
@@ -576,7 +588,10 @@ async def find_live_streams(req: FindStreamsRequest):
     validate_stream_url(req.list_url)
     try:
         streams = await extract_live_streams(req.list_url)
-        return {"streams": streams}
+        hint = ""
+        if not streams:
+            hint = "未找到直播。若確定有直播中，請直接貼上影片頁面 URL（含 vdvno 參數）或 m3u8 串流網址，使用「直接錄製」。"
+        return {"streams": streams, "hint": hint}
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"無法存取列表頁: {e}")
 

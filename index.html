@@ -481,7 +481,8 @@
                 listDiv.innerHTML = '';
 
                 if (streams.length === 0) {
-                    listDiv.innerHTML = '<div style="color: #6b7280; padding: 1rem;">沒有找到正在直播的影片。</div>';
+                    const hint = data.hint || '沒有找到正在直播的影片。';
+                    listDiv.innerHTML = `<div style="color: #92400e; padding: 1rem; background: #fefce8; border-radius: 0.5rem;">${escapeHtml(hint)}</div>`;
                     document.getElementById('startRecSelectedBtn').disabled = true;
                 } else {
                     streams.forEach((s, i) => {
