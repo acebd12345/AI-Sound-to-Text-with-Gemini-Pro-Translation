@@ -13,3 +13,4 @@ gpu-worker/
 *.txt
 !requirements.txt
 !Dockerfile
+.claude/
