@@ -153,6 +153,31 @@
                 </div>
                 <div id="segmentResults" class="seg-list"></div>
             </div>
+
+            <!-- Browser Recording (YouTube streams) -->
+            <div id="browserRecSection" style="display: none;">
+                <div id="youtubeEmbedContainer" style="margin-bottom: 1rem; border-radius: 0.5rem; overflow: hidden; background: #000;">
+                    <iframe id="youtubeEmbed" width="100%" height="300" frameborder="0"
+                        allow="autoplay; encrypted-media" allowfullscreen style="display: block;"></iframe>
+                </div>
+                <div class="rec-status">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <div>
+                            <span class="pulse" id="browserRecPulse"></span>
+                            <strong id="browserRecTitle">瀏覽器錄音中</strong>
+                        </div>
+                        <button onclick="stopBrowserRecording()" class="btn-danger">停止錄音</button>
+                    </div>
+                    <div style="margin-top: 0.75rem; color: #6b7280; font-size: 0.9rem;">
+                        已錄製：<strong id="browserRecElapsed">00:00:00</strong> |
+                        已完成 <strong id="browserRecSegCount">0</strong> 段
+                    </div>
+                    <div style="margin-top: 0.5rem; font-size: 0.8rem; color: #92400e; background: #fefce8; padding: 0.5rem; border-radius: 0.25rem;">
+                        請勿關閉此頁面，並確保 YouTube 播放器已取消靜音。每 30 分鐘自動切段上傳處理。
+                    </div>
+                </div>
+                <div id="browserSegResults" class="seg-list"></div>
+            </div>
         </div>
 
         <div class="history-section">
@@ -454,6 +479,21 @@
         let selectedStreamUrl = null;
         let selectedStreamTitle = null;
         let recPollTimer = null;
+        let selectedStreamSourceType = null;
+        let selectedStreamVdvUrl = null;
+
+        // Browser-based recording state
+        let browserRecSession = null;
+        let mediaRecorder = null;
+        let displayStream = null;
+        let audioOnlyStream = null;
+        let browserRecSegments = [];
+        let browserRecTimer = null;
+        let browserRecStartTime = null;
+        let browserRecSegmentNum = 0;
+        let browserRecChunks = [];
+        let browserRecElapsedTimer = null;
+        const BROWSER_SEGMENT_MS = 30 * 60 * 1000;
 
         async function searchLiveStreams() {
             const url = document.getElementById('streamUrlInput').value.trim();
@@ -509,6 +549,8 @@
                             // 優先用影片頁 URL（後端會透過 API 提取串流）
                             selectedStreamUrl = s.url;
                             selectedStreamTitle = s.title;
+                            selectedStreamSourceType = s.source_type;
+                            selectedStreamVdvUrl = s.vdv_url;
                             document.getElementById('startRecSelectedBtn').disabled = false;
                         };
                         listDiv.appendChild(div);
@@ -526,12 +568,21 @@
         async function startDirectRecording() {
             const url = document.getElementById('streamUrlInput').value.trim();
             if (!url) return alert('請輸入串流 URL');
-            await doStartRecording(url, '直播錄製');
+            if (url.includes('youtube.com') || url.includes('youtu.be')) {
+                await startBrowserRecording(url, 'YouTube 直播');
+            } else {
+                await doStartRecording(url, '直播錄製');
+            }
         }
 
         async function startRecordingSelected() {
             if (!selectedStreamUrl) return alert('請先選擇一個直播');
-            await doStartRecording(selectedStreamUrl, selectedStreamTitle || '直播錄製');
+            if (selectedStreamSourceType === 'youtube') {
+                const embedUrl = selectedStreamVdvUrl || selectedStreamUrl;
+                await startBrowserRecording(embedUrl, selectedStreamTitle || '直播錄製');
+            } else {
+                await doStartRecording(selectedStreamUrl, selectedStreamTitle || '直播錄製');
+            }
         }
 
         async function doStartRecording(streamUrl, title) {
@@ -662,6 +713,238 @@
                 console.error('Stop recording error:', e);
             }
         }
+
+        // --- Browser-based Recording (YouTube streams) ---
+
+        function toYouTubeEmbedUrl(url) {
+            if (!url) return '';
+            // Already an embed URL
+            if (url.includes('/embed/')) {
+                return url + (url.includes('?') ? '&' : '?') + 'autoplay=1';
+            }
+            // Regular YouTube URL → extract video ID
+            const match = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/)([a-zA-Z0-9_-]+)/);
+            if (match) return `https://www.youtube.com/embed/${match[1]}?autoplay=1`;
+            // Fallback
+            return url;
+        }
+
+        async function startBrowserRecording(embedUrl, title) {
+            try {
+                // Show YouTube embed first so user can see it
+                const iframe = document.getElementById('youtubeEmbed');
+                iframe.src = toYouTubeEmbedUrl(embedUrl);
+
+                // Brief delay so the iframe can start loading
+                await new Promise(r => setTimeout(r, 500));
+
+                // Request tab audio capture via getDisplayMedia
+                const displayMediaOptions = { video: true, audio: true };
+                // Chrome: prefer sharing the current tab
+                if (navigator.userAgent.includes('Chrome')) {
+                    displayMediaOptions.preferCurrentTab = true;
+                    displayMediaOptions.selfBrowserSurface = 'include';
+                }
+
+                displayStream = await navigator.mediaDevices.getDisplayMedia(displayMediaOptions);
+
+                const audioTracks = displayStream.getAudioTracks();
+                if (audioTracks.length === 0) {
+                    displayStream.getTracks().forEach(t => t.stop());
+                    throw new Error('未取得音訊軌道。請確保分享時勾選了「分享音訊」(Share audio)。');
+                }
+
+                // Create audio-only stream for MediaRecorder
+                // Keep displayStream alive (don't stop video tracks — some browsers
+                // end the capture session if all video tracks are stopped)
+                audioOnlyStream = new MediaStream(audioTracks);
+
+                // Session setup
+                const suffix = Math.random().toString(36).substring(2, 8);
+                browserRecSession = {
+                    id: `brec_${Date.now()}_${suffix}`,
+                    title: title,
+                    stopped: false,
+                };
+                browserRecSegmentNum = 0;
+                browserRecSegments = [];
+                browserRecStartTime = Date.now();
+
+                // Handle user revoking sharing permission
+                audioTracks[0].onended = () => {
+                    console.log('Audio sharing ended by user');
+                    stopBrowserRecording();
+                };
+
+                // Show browser recording UI
+                document.getElementById('streamSearchResults').style.display = 'none';
+                document.getElementById('recordingStatus').style.display = 'none';
+                document.getElementById('browserRecSection').style.display = 'block';
+                document.getElementById('browserRecTitle').innerText = title;
+                document.getElementById('browserRecElapsed').innerText = '00:00:00';
+                document.getElementById('browserRecSegCount').innerText = '0';
+                document.getElementById('browserSegResults').innerHTML = '';
+                document.getElementById('searchStreamsBtn').disabled = true;
+                document.getElementById('directRecordBtn').disabled = true;
+
+                // Start elapsed timer display
+                browserRecElapsedTimer = setInterval(updateBrowserRecElapsed, 1000);
+
+                // Start first recording segment
+                startBrowserSegment();
+
+            } catch (e) {
+                if (displayStream) {
+                    displayStream.getTracks().forEach(t => t.stop());
+                    displayStream = null;
+                }
+                audioOnlyStream = null;
+                browserRecSession = null;
+                document.getElementById('youtubeEmbed').src = '';
+                document.getElementById('browserRecSection').style.display = 'none';
+                alert('瀏覽器錄音啟動失敗: ' + e.message);
+                document.getElementById('searchStreamsBtn').disabled = false;
+                document.getElementById('directRecordBtn').disabled = false;
+            }
+        }
+
+        function startBrowserSegment() {
+            if (!browserRecSession || browserRecSession.stopped || !audioOnlyStream) return;
+
+            browserRecChunks = [];
+
+            const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+                ? 'audio/webm;codecs=opus'
+                : 'audio/webm';
+
+            mediaRecorder = new MediaRecorder(audioOnlyStream, {
+                mimeType: mimeType,
+                audioBitsPerSecond: 128000,
+            });
+
+            mediaRecorder.ondataavailable = (e) => {
+                if (e.data.size > 0) browserRecChunks.push(e.data);
+            };
+
+            mediaRecorder.onstop = async () => {
+                const blob = new Blob(browserRecChunks, { type: 'audio/webm' });
+                browserRecChunks = [];
+
+                // Only upload if there's meaningful audio (> 10KB)
+                if (blob.size > 10240) {
+                    await uploadBrowserSegment(blob);
+                }
+
+                // Start next segment if not stopped
+                if (browserRecSession && !browserRecSession.stopped && audioOnlyStream) {
+                    startBrowserSegment();
+                }
+            };
+
+            mediaRecorder.start(1000); // Collect data every second
+
+            // Auto-stop after 30 minutes to create a new segment
+            browserRecTimer = setTimeout(() => {
+                if (mediaRecorder && mediaRecorder.state === 'recording') {
+                    mediaRecorder.stop(); // triggers onstop → upload → next segment
+                }
+            }, BROWSER_SEGMENT_MS);
+        }
+
+        async function uploadBrowserSegment(blob) {
+            const segNum = browserRecSegmentNum++;
+            const fileId = `${browserRecSession.id}_seg${segNum}`;
+            const mode = document.getElementById('recProcessMode').value;
+            const diarize = document.getElementById('recDiarizeToggle').checked;
+            const knownNames = document.getElementById('recKnownNamesInput').value.trim();
+
+            const fd = new FormData();
+            fd.append('file_chunk', blob, `${fileId}.webm`);
+            fd.append('chunk_index', '0');
+            fd.append('total_chunks', '1');
+            fd.append('file_id', fileId);
+            fd.append('mode', mode);
+            fd.append('diarize', diarize);
+            if (knownNames) fd.append('known_names', knownNames);
+
+            try {
+                await fetchWithRetry(`${API_URL}/upload_chunk`, { method: 'POST', body: fd });
+
+                browserRecSegments.push({ file_id: fileId, segNum: segNum });
+                addHistoryItemIfNotExists(fileId, `${browserRecSession.title} (片段 ${segNum + 1})`, 1);
+                updateBrowserRecUI();
+            } catch (e) {
+                console.error('Browser segment upload failed:', e);
+            }
+        }
+
+        function updateBrowserRecElapsed() {
+            if (!browserRecStartTime) return;
+            const elapsed = Math.floor((Date.now() - browserRecStartTime) / 1000);
+            document.getElementById('browserRecElapsed').innerText = formatDuration(elapsed);
+        }
+
+        function updateBrowserRecUI() {
+            document.getElementById('browserRecSegCount').innerText = browserRecSegments.length;
+
+            const segDiv = document.getElementById('browserSegResults');
+            segDiv.innerHTML = '';
+            browserRecSegments.forEach((seg, i) => {
+                const startMin = i * 30;
+                const endMin = (i + 1) * 30;
+                const el = document.createElement('div');
+                el.className = 'seg-item';
+                el.innerHTML = `
+                    <span>片段 ${i + 1} (${startMin}:00 - ${endMin}:00)</span>
+                    <span style="font-size: 0.8rem; color: #10b981;">已上傳，處理中</span>
+                `;
+                segDiv.appendChild(el);
+            });
+        }
+
+        function stopBrowserRecording() {
+            if (!browserRecSession) return;
+            if (!browserRecSession.stopped && !confirm('確定要停止錄音嗎？')) return;
+
+            browserRecSession.stopped = true;
+
+            if (browserRecTimer) {
+                clearTimeout(browserRecTimer);
+                browserRecTimer = null;
+            }
+            if (browserRecElapsedTimer) {
+                clearInterval(browserRecElapsedTimer);
+                browserRecElapsedTimer = null;
+            }
+
+            // Stop recorder — triggers onstop which uploads the final segment
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                mediaRecorder.stop();
+            }
+
+            // Stop all media tracks
+            if (displayStream) {
+                displayStream.getTracks().forEach(t => t.stop());
+                displayStream = null;
+            }
+            audioOnlyStream = null;
+
+            // Update UI
+            const pulse = document.getElementById('browserRecPulse');
+            if (pulse) pulse.style.display = 'none';
+            document.getElementById('browserRecTitle').innerText += ' (已停止)';
+            document.getElementById('youtubeEmbed').src = '';
+            document.getElementById('searchStreamsBtn').disabled = false;
+            document.getElementById('directRecordBtn').disabled = false;
+        }
+
+        // Warn user before leaving page during browser recording
+        window.addEventListener('beforeunload', (e) => {
+            if (browserRecSession && !browserRecSession.stopped) {
+                e.preventDefault();
+                e.returnValue = '錄音進行中，離開頁面會停止錄音。確定要離開嗎？';
+            }
+        });
     </script>
 </body>
 </html>
