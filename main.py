@@ -14,9 +14,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 from google.cloud import storage
 from google.api_core.exceptions import PreconditionFailed
-import google.generativeai as genai
-import google.ai.generativelanguage as glm
-from google.api_core import client_options as client_options_lib
+from google import genai
+from google.genai import types
 import httpx
 from bs4 import BeautifulSoup
 
@@ -27,7 +26,10 @@ app = FastAPI()
 # --- 設定區 ---
 # 支援多 API Key 輪替：環境變數 GEMINI_API_KEYS（逗號分隔）優先，
 # 若未設定則退回使用單一 GEMINI_API_KEY
-MODEL_NAME = "gemini-3-pro-preview"
+# 模型名稱由環境變數 GEMINI_MODEL 控制，預設 gemini-3.5-flash（已 GA）
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+
+SYSTEM_INSTRUCTION = "你是一個專業的繁體中文（台灣）翻譯專家。你的唯一任務是將傳入的字幕內容，完美且毫無遺漏地翻譯或轉換為台灣慣用的繁體中文。絕對不允許輸出任何簡體字。"
 
 _keys_str = os.getenv("GEMINI_API_KEYS", "")
 GEMINI_API_KEYS = [k.strip() for k in _keys_str.split(",") if k.strip()]
@@ -41,37 +43,23 @@ if not GEMINI_API_KEYS:
 
 print(f"已載入 {len(GEMINI_API_KEYS)} 組 Gemini API Key")
 
-# 為每把 Key 建立獨立的 gRPC client，注入到 GenerativeModel
-# genai.configure 是全域的，GenerativeModel 不會綁定 Key，
-# 所以必須手動建立獨立 client 注入，才能真正做到多 Key 輪替
-genai.configure(api_key=GEMINI_API_KEYS[0])
-
-GEMINI_MODELS = []
+# 每把 Key 建立獨立的 genai.Client，做真正的多 Key 輪替
+GEMINI_CLIENTS = []
 for _key in GEMINI_API_KEYS:
-    model = genai.GenerativeModel(
-        MODEL_NAME,
-        system_instruction="你是一個專業的繁體中文（台灣）翻譯專家。你的唯一任務是將傳入的字幕內容，完美且毫無遺漏地翻譯或轉換為台灣慣用的繁體中文。絕對不允許輸出任何簡體字。"
-    )
-    client_opts = client_options_lib.ClientOptions(
-        api_key=_key,
-        api_endpoint="generativelanguage.googleapis.com",
-    )
-    model._client = glm.GenerativeServiceClient(client_options=client_opts)
-    model._async_client = glm.GenerativeServiceAsyncClient(client_options=client_opts)
-    GEMINI_MODELS.append(model)
-    print(f"  Key ...{_key[-4:]} 已綁定獨立 client")
+    GEMINI_CLIENTS.append(genai.Client(api_key=_key))
+    print(f"  Key ...{_key[-4:]} 已建立 client")
 
 # Key 輪替計數器（Round-Robin）
-_model_counter = 0
-_model_lock = asyncio.Lock()
+_client_counter = 0
+_client_lock = asyncio.Lock()
 
-async def get_next_model() -> genai.GenerativeModel:
-    """Round-Robin 取得下一個 Model（每個有獨立 gRPC client + API Key）"""
-    global _model_counter
-    async with _model_lock:
-        model = GEMINI_MODELS[_model_counter % len(GEMINI_MODELS)]
-        _model_counter += 1
-        return model
+async def get_next_client() -> genai.Client:
+    """Round-Robin 取得下一個 Client（每個綁定獨立 API Key）"""
+    global _client_counter
+    async with _client_lock:
+        client = GEMINI_CLIENTS[_client_counter % len(GEMINI_CLIENTS)]
+        _client_counter += 1
+        return client
 
 storage_client = storage.Client()
 BUCKET_NAME = os.getenv("BUCKET_NAME")
@@ -112,7 +100,7 @@ UPLOAD_DIR = "/tmp"
 
 # 全域 Semaphore：限制所有翻譯任務共享的 Gemini API 併發數
 # 多人同時翻譯時，總併發不會超過此上限，避免觸發 Rate Limit
-GEMINI_SEMAPHORE = asyncio.Semaphore(8)
+GEMINI_SEMAPHORE = asyncio.Semaphore(16)
 
 # 驗證 file_id 防止路徑穿越攻擊
 FILE_ID_PATTERN = re.compile(r'^[\w\-\.]+$')
@@ -137,7 +125,7 @@ def format_timestamp(seconds: float) -> str:
 # --- Gemini 分段翻譯函式 (Async + Retry + Key 輪替) ---
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 2  # 秒，exponential backoff 基底
-API_TIMEOUT = 120  # 秒，單次 API 呼叫超時時間（給 Gemini 充足時間處理）
+API_TIMEOUT = 60  # 秒，單次 API 呼叫超時時間（Flash 速度快）
 
 # 初始化 OpenCC 轉換器 (s2twp.json 代表: 簡體轉繁體台灣，包含慣用語轉換)
 cc = opencc.OpenCC('s2twp')
@@ -191,15 +179,17 @@ CRITICAL RULES:
 {preprocessed_srt}"""
 
         for attempt in range(MAX_RETRIES):
-            model = await get_next_model()
+            client = await get_next_client()
             try:
-                print(f"[Gemini Pro] 翻譯第 {index} 段 (嘗試 {attempt + 1}/{MAX_RETRIES})...")
+                print(f"[Gemini] 翻譯第 {index} 段 (嘗試 {attempt + 1}/{MAX_RETRIES})...")
                 response = await asyncio.wait_for(
-                    model.generate_content_async(
-                        prompt,
-                        generation_config=genai.types.GenerationConfig(
+                    client.aio.models.generate_content(
+                        model=MODEL_NAME,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            system_instruction=SYSTEM_INSTRUCTION,
                             temperature=0.2,
-                        )
+                        ),
                     ),
                     timeout=API_TIMEOUT
                 )
@@ -398,9 +388,9 @@ async def run_translation_background(file_id, total_chunks, bucket):
                     translation_tasks.append(task)
                     ordered_batches.append((i, k)) # 紀錄順序
 
-        # 3. 分波執行翻譯（每波最多 8 個，波與波之間間隔 2 秒，避免瞬間 burst）
-        WAVE_SIZE = 8
-        WAVE_DELAY = 2  # 秒
+        # 3. 分波執行翻譯（每波最多 16 個，波與波之間間隔 1 秒，避免瞬間 burst）
+        WAVE_SIZE = 16
+        WAVE_DELAY = 1  # 秒
         translated_results = []
 
         if translation_tasks:
