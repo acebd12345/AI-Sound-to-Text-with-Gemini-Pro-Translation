@@ -343,6 +343,107 @@ curl http://localhost:8080/health
 | 長音檔出現簡體字 | Gemini 翻譯部分段落失敗，回傳 Whisper 原文 | 確認所有 API Key 無限制 + 使用多把 Key (`GEMINI_API_KEYS`) |
 | 勾選了講者辨識但沒有生效 | pyannote 模型未成功載入 | 檢查 GPU Worker 中是否設定了 `HF_TOKEN` 且是否已在網頁點擊同意授權 |
 
+## 🤖 自動錄製 / Automation
+
+系統可以**無人值守**運作：由排程器（如 Cloud Scheduler）定期打一個受保護端點，
+系統自動偵測「正在直播」的議會會議開始錄製，並自動補抓「會後 VOD」送入既有的
+轉錄翻譯管線。此功能為**新增**，完全不影響既有的手動上傳與手動錄製流程。
+
+### 運作方式
+
+呼叫 `POST /auto_record_check` 時，系統會：
+
+1. **直播掃描**：呼叫 iShare Portal `SPW003_OnAirList`（若為空則退回 `SPW024_VideoLive`
+   並過濾出當前時段內的項目）。對每個正在直播的會議，透過既有的 `get_stream_url()`
+   解析串流並複用 `recording_loop` 開始錄製（每 30 分鐘切段自動進管線）。
+2. **VOD 補抓**：呼叫 `SPW002_vdoTypeList` 動態取得 10 個頻道，逐頻道以
+   `SPW046_VideoList` 查詢「今天與昨天」（台灣時區 UTC+8，西元 `yyyy/mm/dd`）的 VOD，
+   對每筆影片以 ffmpeg 一次全速下載並自動切段（選最低畫質 m3u8 省頻寬），逐段上傳
+   `raw_audio/` 進管線。
+3. **去重**：每個 vdvno 在 GCS `auto_state/live/{vdvno}` 或 `auto_state/vod/{vdvno}`
+   建立原子 marker（`if_generation_match=0`），搶不到鎖代表別的請求已在處理，直接跳過。
+   因此排程器可以安全地高頻重複觸發，同一場會議不會被重複錄製或下載。
+4. **回傳摘要**：JSON `{"live_started": [...], "vods_queued": [{vdvno, title,
+   file_id_prefix}...], "skipped": n}`，讓呼叫方（如 Hermes）知道發生了什麼、之後要輪詢
+   哪些 `file_id` 的 `/check_status`。
+
+> **注意**：翻譯是由前端輪詢 `/check_status` 觸發的。自動錄製只負責把音檔送進 `raw_audio/`，
+> 呼叫方需依回傳的 `file_id`（VOD 為 `{file_id_prefix}{n}`）代為輪詢 `/check_status` 才會啟動翻譯。
+
+### 驗證機制
+
+端點以環境變數 `AUTO_TRIGGER_SECRET` 保護，請求需帶 header `X-Trigger-Secret`：
+
+| 情況 | 回應 |
+|------|------|
+| `AUTO_TRIGGER_SECRET` 未設定 | `503`（功能停用） |
+| header 缺少或不符（`secrets.compare_digest` 比對） | `403` |
+| 驗證通過 | `200` + 摘要 JSON |
+
+### 新增環境變數
+
+| 變數 | 預設 | 說明 |
+|------|------|------|
+| `AUTO_TRIGGER_SECRET` | （無） | 觸發端點的共享密鑰；未設定則端點回 503 |
+| `AUTO_RECORD_MODE` | `speech` | 自動錄製的模式（`speech` / `song`） |
+| `AUTO_RECORD_DIARIZE` | `false` | 是否啟用講者辨識 |
+| `AUTO_RECORD_KNOWN_NAMES` | （空） | 已知講者人名（供 diarize 對應） |
+
+### GCS 路徑約定
+
+| 路徑 | 用途 |
+|------|------|
+| `auto_state/live/{vdvno}` | 直播已處理/處理中的 marker（JSON：`started_at`/`title`/`file_ids`/`total_segments`/`status`） |
+| `auto_state/vod/{vdvno}` | VOD 已處理/處理中的 marker（同上結構） |
+
+marker 存在即代表「已處理/處理中」；處理失敗時 marker 會被刪除，讓下次掃描重試。
+建議搭配 GCS Lifecycle 規則定期清理 `auto_state/`。
+
+### Cloud Run 部署需求
+
+自動錄製沿用直播錄製的實例記憶體限制，且需要背景任務在沒有請求時仍持續執行，
+因此部署時務必：
+
+```bash
+gcloud run services update sound-to-text-web \
+  --region $LOCATION \
+  --no-cpu-throttling \
+  --min-instances 1 \
+  --max-instances 1
+```
+
+- `--no-cpu-throttling`：沒有請求時 CPU 不被凍結，背景錄製/下載任務才不會停擺。
+- `--min-instances 1`：保持實例常駐，避免正在錄製時實例被回收。
+- `--max-instances 1`：錄製 session 存於實例記憶體，單一實例避免狀態分裂。
+
+設定觸發密鑰：
+
+```bash
+gcloud run services update sound-to-text-web \
+  --region $LOCATION \
+  --update-env-vars AUTO_TRIGGER_SECRET=$(openssl rand -hex 32)
+```
+
+### Cloud Scheduler 設定範例
+
+在議會開會時段（例如週一至週五 09:00–18:00，台灣時間）每 5 分鐘觸發一次：
+
+```bash
+# 先把 secret 存起來，與 Cloud Run 上設定的相同
+export TRIGGER_SECRET="貼上與 AUTO_TRIGGER_SECRET 相同的值"
+export SERVICE_URL="https://sound-to-text-web-xyz.a.run.app"
+
+gcloud scheduler jobs create http auto-record-check \
+  --location=$LOCATION \
+  --schedule="*/5 9-18 * * 1-5" \
+  --time-zone="Asia/Taipei" \
+  --uri="${SERVICE_URL}/auto_record_check" \
+  --http-method=POST \
+  --headers="X-Trigger-Secret=${TRIGGER_SECRET}"
+```
+
+> 高頻觸發是安全的：`auto_state/` 原子 marker 會確保同一場會議只被處理一次。
+
 ## 📂 目錄結構
 
 ```
@@ -370,6 +471,11 @@ curl http://localhost:8080/health
 | GET | `/health` | 健康檢查 |
 | POST | `/upload_chunk` | 上傳音訊切片 |
 | GET | `/check_status/{file_id}` | 查詢處理進度 |
+| POST | `/find_live_streams` | 搜尋列表頁中正在直播的影片 |
+| POST | `/start_recording` | 開始錄製直播串流（每 30 分鐘切段） |
+| POST | `/stop_recording/{session_id}` | 停止錄製 |
+| GET | `/recording_status/{session_id}` | 查詢錄製狀態 |
+| POST | `/auto_record_check` | 自動觸發端點（需 `X-Trigger-Secret`）：掃直播開錄、補抓 VOD |
 
 **GPU Worker：**
 
@@ -381,7 +487,7 @@ curl http://localhost:8080/health
 ## 📝 注意事項
 
 *   **成本控制**：Cloud Run GPU 與 Gemini API 可能會產生費用，請留意您的 GCP 帳單與配額。
-*   **檔案清理**：GCS 上的暫存檔案 (`raw_audio/`、`transcripts/`、`locks/`) 目前不會自動刪除，建議設定 GCS Lifecycle 規則定期清理。
+*   **檔案清理**：GCS 上的暫存檔案 (`raw_audio/`、`transcripts/`、`locks/`、`auto_state/`) 目前不會自動刪除，建議設定 GCS Lifecycle 規則定期清理。
 *   **模型載入**：GPU Worker 啟動時需要載入 Whisper 模型，第一次請求可能會有 Cold Start 延遲（約 30-60 秒）。
 *   **localStorage 限制**：翻譯結果暫存於瀏覽器 localStorage（5-10MB 上限），大量使用後建議清除歷史紀錄。
 
