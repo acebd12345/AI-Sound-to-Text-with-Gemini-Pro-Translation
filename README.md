@@ -1,13 +1,13 @@
 # AI 語音轉錄與翻譯系統 (Pro 版)
 
-這是一個強大的語音轉文字 (Speech-to-Text) 與翻譯系統，結合了 **OpenAI Whisper (faster-whisper)** 的精準轉錄能力與 **Google Gemini 3 Pro (Preview)** 的高品質翻譯能力。
+這是一個強大的語音轉文字 (Speech-to-Text) 與翻譯系統，結合了 **OpenAI Whisper (faster-whisper)** 的精準轉錄能力與 **Google Gemini 3.5 Flash** 的高品質翻譯能力。
 
 本系統專為處理長錄音檔設計，支援自動分段、斷點續傳，並利用 Google Cloud Platform (GCP) 的 GPU 加速轉錄過程，最後輸出繁體中文 (台灣) 的 SRT 字幕檔。
 
 ## ✨ 主要功能
 
-*   **高精準度轉錄**：使用 `faster-whisper` (Large-v3-turbo 模型) 進行語音識別，支援多語言輸入。
-*   **專業級翻譯**：整合 Google Gemini 3 Pro (Preview) 模型，將轉錄內容翻譯成流暢的繁體中文 (台灣)。
+*   **高精準度轉錄**：使用 `faster-whisper` (Large-v3-turbo 模型) 進行語音識別，以中文內容為主。
+*   **專業級翻譯**：整合 Google Gemini 3.5 Flash 模型，將轉錄內容翻譯成流暢的繁體中文 (台灣)。可透過環境變數 `GEMINI_MODEL` 覆寫模型名稱（預設 `gemini-3.5-flash`）。
 *   **講者辨識 (Diarization)**：整合 `pyannote.audio` 與 Gemini 語境分析，自動標記講者與已知人名。
 *   **簡轉繁保障**：使用 OpenCC (s2twp) 預處理，即使 Gemini API 失敗也保證輸出繁體中文。
 *   **多 API Key 輪替**：支援多把 Gemini API Key Round-Robin 輪替，搭配自動重試機制，大幅提升長音檔翻譯穩定性。
@@ -61,7 +61,7 @@ GPU Worker 轉錄 → JSON 存至 transcripts/
     ↓
 全部轉錄完成 → OpenCC 預處理 (簡轉繁)
     ↓
-Gemini Pro 分波翻譯（每波 8 個，每批 20 段，失敗自動重試 3 次）
+Gemini 分波翻譯（每波 16 個，每批 20 段，失敗自動重試 3 次）
     ↓
 翻譯完成 → 存至 final_results/ → 前端下載 SRT / 純文字
 ```
@@ -205,6 +205,17 @@ gcloud run services update sound-to-text-web \
   --update-env-vars ALLOWED_ORIGINS=https://sound-to-text-web-xyz.a.run.app
 ```
 
+> **直播錄製的部署限制**：直播錄製 session 存放於 API Server 的實例記憶體中，因此部署時必須：
+> - 使用 CPU always-allocated（`--no-cpu-throttling`），否則沒有請求時 CPU 會被凍結，背景錄製任務會停擺。
+> - 限制單一實例（`--max-instances 1`），避免同一 session 的請求被路由到不同實例而找不到錄製狀態。
+>
+> ```bash
+> gcloud run services update sound-to-text-web \
+>   --region $LOCATION \
+>   --no-cpu-throttling \
+>   --max-instances 1
+> ```
+
 ### 第三步：部署 GPU Worker
 
 進入 Worker 目錄並部署至 Cloud Run（需 GPU，使用 NVIDIA L4）：
@@ -279,7 +290,7 @@ gcloud eventarc triggers create trigger-whisper \
 3. 觀察狀態變化：
    - 「上傳完成」→ Eventarc 觸發 Worker 開始轉錄
    - 「等待轉錄中」→ Worker 正在處理
-   - 「AI 正在翻譯中」→ Gemini Pro 翻譯中
+   - 「AI 正在翻譯中」→ Gemini 翻譯中
    - 「完成」→ 可下載 SRT 字幕檔
 
 ### 部署後檢查
@@ -369,7 +380,7 @@ curl http://localhost:8080/health
 
 ## 📝 注意事項
 
-*   **成本控制**：Cloud Run GPU 與 Gemini Pro API 可能會產生費用，請留意您的 GCP 帳單與配額。
+*   **成本控制**：Cloud Run GPU 與 Gemini API 可能會產生費用，請留意您的 GCP 帳單與配額。
 *   **檔案清理**：GCS 上的暫存檔案 (`raw_audio/`、`transcripts/`、`locks/`) 目前不會自動刪除，建議設定 GCS Lifecycle 規則定期清理。
 *   **模型載入**：GPU Worker 啟動時需要載入 Whisper 模型，第一次請求可能會有 Cold Start 延遲（約 30-60 秒）。
 *   **localStorage 限制**：翻譯結果暫存於瀏覽器 localStorage（5-10MB 上限），大量使用後建議清除歷史紀錄。
