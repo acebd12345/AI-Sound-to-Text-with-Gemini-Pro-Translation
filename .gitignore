@@ -13,3 +13,8 @@ final_results/
 *.mp3
 *.txt
 !requirements.txt
+
+# Hermes kit：密鑰不入版控
+hermes-kit/secret.txt
+hermes-kit/.env
+hermes-kit/output/
