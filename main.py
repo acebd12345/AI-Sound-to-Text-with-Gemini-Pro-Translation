@@ -4,12 +4,13 @@ import json
 import time
 import random
 import socket
+import secrets
 import asyncio
 import ipaddress
 import opencc
 from urllib.parse import urljoin
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, Form, BackgroundTasks, HTTPException
+from fastapi import FastAPI, UploadFile, Form, BackgroundTasks, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -909,6 +910,395 @@ async def recording_loop(session_id, stream_url, mode, diarize, known_names):
         rec["status"] = "stopped"
         rec.pop("_ffmpeg_proc", None)
         print(f"[錄製] {session_id} 錄製結束，共 {len(rec['segments'])} 段")
+
+
+# --- 自動錄製：處理狀態落地 GCS（去重基礎） ---
+# 約定路徑：
+#   auto_state/vod/{vdvno}  → VOD 已處理/處理中的 marker
+#   auto_state/live/{vdvno} → 直播已處理/處理中的 marker
+# marker 內容為 JSON：{"started_at", "title", "file_ids", "total_segments", "status"}
+# 建立時以 if_generation_match=0 原子寫入，搶不到代表別的請求已在處理。
+# 失敗時刪除 marker，讓下次掃描重試。
+
+def _auto_state_path(kind: str, vdvno: str) -> str:
+    return f"auto_state/{kind}/{vdvno}"
+
+
+def claim_auto_state(bucket, kind: str, vdvno: str, title: str = "") -> bool:
+    """原子性搶鎖：成功建立 marker 回傳 True；已存在回傳 False。"""
+    blob = bucket.blob(_auto_state_path(kind, vdvno))
+    payload = json.dumps({
+        "started_at": time.time(),
+        "title": title,
+        "file_ids": [],
+        "total_segments": 0,
+        "status": "processing",
+    })
+    try:
+        blob.upload_from_string(payload, if_generation_match=0)
+        return True
+    except PreconditionFailed:
+        return False
+
+
+def update_auto_state(bucket, kind: str, vdvno: str, **fields) -> None:
+    """更新 marker 內的欄位（best-effort，不拋例外）。"""
+    blob = bucket.blob(_auto_state_path(kind, vdvno))
+    try:
+        data = json.loads(blob.download_as_text())
+    except Exception:
+        data = {}
+    data.update(fields)
+    try:
+        blob.upload_from_string(json.dumps(data))
+    except Exception as e:
+        print(f"[auto_state] 更新 {kind}/{vdvno} 失敗: {e}")
+
+
+def release_auto_state(bucket, kind: str, vdvno: str) -> None:
+    """刪除 marker，讓下次掃描可重試（失敗時清理用）。"""
+    try:
+        bucket.blob(_auto_state_path(kind, vdvno)).delete()
+    except Exception:
+        pass
+
+
+# --- 自動錄製：VOD 下載函式（核心新功能） ---
+VOD_DOWNLOAD_TIMEOUT = 3600  # 整體下載+切段的 timeout（秒）
+
+
+def _pick_vod_stream_url(video_url_list: list) -> str:
+    """從 VideoURLList 挑最低畫質的 m3u8（音訊轉錄不需高畫質，省頻寬）。
+    優先順序：480p → 720p → 1080p → auto → 任一筆。"""
+    if not video_url_list:
+        return ""
+
+    def _src(item):
+        if isinstance(item, dict):
+            return item.get("src", "") or ""
+        return str(item)
+
+    def _label(item):
+        if isinstance(item, dict):
+            # 常見欄位：definition / quality / title / label
+            for k in ("definition", "quality", "title", "label", "name"):
+                v = item.get(k)
+                if v:
+                    return str(v).lower()
+        return _src(item).lower()
+
+    # 畫質偏好由低到高
+    for pref in ("480", "720", "1080"):
+        for item in video_url_list:
+            if pref in _label(item) and _src(item):
+                return _src(item)
+    # 再退回 auto
+    for item in video_url_list:
+        if "auto" in _label(item) and _src(item):
+            return _src(item)
+    # 最後退回任一筆有 src 的
+    for item in video_url_list:
+        if _src(item):
+            return _src(item)
+    return ""
+
+
+async def _resolve_vod_stream(vdvno: str) -> tuple:
+    """打 SPW010_VideoData 取串流 URL 與標題。回傳 (stream_url, title)。"""
+    api_base = "https://live.tcc.gov.tw/iSharePortalWeb/api/"
+    video_api = f"{api_base}SPW010_VideoData?vdv_vdvno={vdvno}"
+    referer = "https://live.tcc.gov.tw/iSharePortalWeb/User/Default.aspx"
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        resp = await client.get(video_api, headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": referer,
+        })
+        resp.raise_for_status()
+    data = resp.json()
+    if isinstance(data, list) and data:
+        data = data[0]
+    if not isinstance(data, dict):
+        return "", ""
+    title = data.get("vdv_title", "") or ""
+    url_list = data.get("VideoURLList", []) or []
+    stream = _pick_vod_stream_url(url_list)
+    if not stream:
+        stream = data.get("vdv_url", "") or ""
+    return stream, title
+
+
+async def fetch_vod_background(vdvno: str, mode: str, diarize: bool, known_names: str):
+    """下載 VOD（一次拉全速並自動切段），逐段上傳 GCS 進管線。
+
+    VOD 不是直播，用 ffmpeg segment 一次下載並切段，不能重用 recording_loop
+    （後者每段重新連線會重複錄開頭）。
+    """
+    bucket = storage_client.bucket(BUCKET_NAME)
+    short = vdvno[:8]
+    local_pattern = f"/tmp/vod_{short}_%03d.wav"
+
+    def _cleanup_local():
+        try:
+            import glob
+            for p in glob.glob(f"/tmp/vod_{short}_*.wav"):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    try:
+        stream_url, title = await _resolve_vod_stream(vdvno)
+        if not stream_url:
+            print(f"[VOD] {vdvno} 無法解析串流 URL，放棄")
+            release_auto_state(bucket, "vod", vdvno)
+            return
+
+        # SSRF 驗證（tccstr2.tcc.gov.tw 在白名單內）
+        try:
+            validate_stream_url(stream_url)
+        except HTTPException as e:
+            print(f"[VOD] {vdvno} 串流 URL 驗證失敗: {e.detail}")
+            release_auto_state(bucket, "vod", vdvno)
+            return
+
+        update_auto_state(bucket, "vod", vdvno, title=title)
+        print(f"[VOD] {vdvno} 開始下載: {stream_url}")
+
+        # ffmpeg 一次下載並自動切段（全速拉）
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y",
+            "-user_agent", "Mozilla/5.0",
+            "-i", stream_url,
+            "-vn",
+            "-acodec", "pcm_s16le",
+            "-ar", "16000",
+            "-ac", "1",
+            "-f", "segment",
+            "-segment_time", str(SEGMENT_DURATION),
+            local_pattern,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, stderr_data = await asyncio.wait_for(
+                proc.communicate(), timeout=VOD_DOWNLOAD_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            print(f"[VOD] {vdvno} 下載超時 ({VOD_DOWNLOAD_TIMEOUT}s)，終止")
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            _cleanup_local()
+            release_auto_state(bucket, "vod", vdvno)
+            return
+
+        ffmpeg_log = stderr_data.decode(errors='replace')[-500:]
+        print(f"[VOD] {vdvno} ffmpeg 輸出 (末 500 字): {ffmpeg_log}")
+
+        # 收集切出的段（依序）
+        import glob
+        seg_files = sorted(glob.glob(f"/tmp/vod_{short}_*.wav"))
+        seg_files = [p for p in seg_files if os.path.getsize(p) >= 10240]
+        if not seg_files:
+            print(f"[VOD] {vdvno} 未產生有效切段，放棄")
+            _cleanup_local()
+            release_auto_state(bucket, "vod", vdvno)
+            return
+
+        loop = asyncio.get_running_loop()
+        file_ids = []
+        for n, seg_path in enumerate(seg_files):
+            file_id = f"vod_{short}_seg{n}"
+            validate_file_id(file_id)
+
+            meta_blob = bucket.blob(f"raw_audio/{file_id}/metadata.json")
+            meta_content = json.dumps({
+                "mode": mode,
+                "diarize": diarize,
+                "known_names": known_names,
+                "vdv_title": title,
+            })
+            await loop.run_in_executor(None, meta_blob.upload_from_string, meta_content)
+
+            audio_blob = bucket.blob(f"raw_audio/{file_id}/0")
+            await loop.run_in_executor(None, audio_blob.upload_from_filename, seg_path)
+
+            os.remove(seg_path)
+            file_ids.append(file_id)
+            print(f"[VOD] {vdvno} 第 {n} 段已上傳 (file_id={file_id})")
+
+        update_auto_state(
+            bucket, "vod", vdvno,
+            file_ids=file_ids,
+            total_segments=len(file_ids),
+            status="uploaded",
+        )
+        print(f"[VOD] {vdvno} 完成，共 {len(file_ids)} 段進管線")
+
+    except Exception as e:
+        print(f"[VOD] {vdvno} 下載失敗: {e}")
+        _cleanup_local()
+        release_auto_state(bucket, "vod", vdvno)
+
+
+# --- 自動錄製：直播/VOD 掃描與觸發端點 ---
+ISHARE_API_BASE = "https://live.tcc.gov.tw/iSharePortalWeb/api/"
+ISHARE_REFERER = "https://live.tcc.gov.tw/iSharePortalWeb/User/Default.aspx"
+
+
+async def _ishare_get(endpoint: str, params: dict = None):
+    """呼叫 iShare Portal API，回傳解析後的 JSON（失敗回 None）。"""
+    url = f"{ISHARE_API_BASE}{endpoint}"
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            resp = await client.get(url, params=params, headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": ISHARE_REFERER,
+            })
+            resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        print(f"[auto] 呼叫 {endpoint} 失敗: {e}")
+        return None
+
+
+def _tw_dates_today_yesterday() -> list:
+    """回傳台灣時區（UTC+8）今天與昨天的西元 yyyy/mm/dd 字串。"""
+    from datetime import datetime, timezone, timedelta
+    tw_tz = timezone(timedelta(hours=8))
+    now = datetime.now(tw_tz)
+    today = now.strftime("%Y/%m/%d")
+    yesterday = (now - timedelta(days=1)).strftime("%Y/%m/%d")
+    return [today, yesterday]
+
+
+@app.post("/auto_record_check")
+async def auto_record_check(request: Request, background_tasks: BackgroundTasks):
+    """自動觸發端點（排程器/Hermes 入口）：掃直播開錄、掃 VOD 補抓。"""
+    # 1. 驗證
+    expected = os.getenv("AUTO_TRIGGER_SECRET", "")
+    if not expected:
+        raise HTTPException(status_code=503, detail="自動錄製功能未啟用（AUTO_TRIGGER_SECRET 未設定）")
+    provided = request.headers.get("X-Trigger-Secret", "")
+    if not secrets.compare_digest(provided, expected):
+        raise HTTPException(status_code=403, detail="X-Trigger-Secret 驗證失敗")
+
+    # 自動觸發預設參數（環境變數控制）
+    auto_mode = os.getenv("AUTO_RECORD_MODE", "speech")
+    auto_diarize = os.getenv("AUTO_RECORD_DIARIZE", "false").strip().lower() in ("1", "true", "yes")
+    auto_known_names = os.getenv("AUTO_RECORD_KNOWN_NAMES", "")
+
+    bucket = storage_client.bucket(BUCKET_NAME)
+    live_started = []
+    vods_queued = []
+    skipped = 0
+
+    # 2. 直播掃描：SPW003_OnAirList，空則退回 SPW024_VideoLive 過濾 live
+    on_air = await _ishare_get("SPW003_OnAirList")
+    live_items = on_air if isinstance(on_air, list) and on_air else []
+    if not live_items:
+        video_live = await _ishare_get("SPW024_VideoLive")
+        if isinstance(video_live, list):
+            from datetime import datetime, timezone, timedelta
+            tw_tz = timezone(timedelta(hours=8))
+            now = datetime.now(tw_tz).replace(tzinfo=None)
+            for item in video_live:
+                ld = item.get("LiveDate", "")
+                bt = item.get("LiveBTime", "")
+                et = item.get("LiveETime", "")
+                try:
+                    start_dt = datetime.strptime(f"{ld} {bt}", "%Y/%m/%d %H:%M")
+                    end_dt = datetime.strptime(f"{ld} {et}", "%Y/%m/%d %H:%M")
+                    if start_dt <= now <= end_dt:
+                        live_items.append(item)
+                except Exception:
+                    continue
+
+    for item in live_items:
+        vdvno = item.get("vdv_vdvno", "") or item.get("VideoNo", "")
+        if not vdvno:
+            skipped += 1
+            continue
+        title = item.get("vdv_title", "") or item.get("vdt_title", "") or "直播錄製"
+        if not claim_auto_state(bucket, "live", vdvno, title):
+            skipped += 1
+            continue
+        # 開錄：走既有 get_stream_url + recording_loop
+        try:
+            video_page_url = urljoin(ISHARE_REFERER, f"VideoData.aspx?vdvno={vdvno}")
+            stream_url = await get_stream_url(video_page_url)
+            validate_stream_url(stream_url)
+
+            suffix = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=6))
+            session_id = f"rec_{int(time.time())}_{suffix}"
+            active_recordings[session_id] = {
+                "status": "recording",
+                "stream_url": stream_url,
+                "title": title,
+                "mode": auto_mode,
+                "diarize": auto_diarize,
+                "known_names": auto_known_names,
+                "segments": [],
+                "stop": False,
+                "started_at": time.time(),
+                "error": None,
+                "auto_vdvno": vdvno,
+            }
+            background_tasks.add_task(
+                recording_loop, session_id, stream_url,
+                auto_mode, auto_diarize, auto_known_names
+            )
+            update_auto_state(bucket, "live", vdvno, session_id=session_id, status="recording")
+            live_started.append({"vdvno": vdvno, "title": title, "session_id": session_id})
+            print(f"[auto] 直播開錄 {vdvno} ({title}) → {session_id}")
+        except Exception as e:
+            print(f"[auto] 直播 {vdvno} 開錄失敗: {e}")
+            release_auto_state(bucket, "live", vdvno)
+            skipped += 1
+
+    # 3. VOD 掃描：SPW002 拿頻道，逐頻道逐日期打 SPW046
+    channels = await _ishare_get("SPW002_vdoTypeList")
+    if isinstance(channels, list):
+        dates = _tw_dates_today_yesterday()
+        for ch in channels:
+            vdtno = ch.get("vdt_vdtno", "")
+            if not vdtno:
+                continue
+            for d in dates:
+                vod_list = await _ishare_get("SPW046_VideoList", params={
+                    "vdt_vdtno": vdtno,
+                    "vdv_opendate": d,
+                })
+                if not isinstance(vod_list, list):
+                    continue
+                for vod in vod_list:
+                    vdvno = vod.get("vdv_vdvno", "")
+                    if not vdvno:
+                        continue
+                    title = vod.get("vdv_title", "") or ""
+                    if not claim_auto_state(bucket, "vod", vdvno, title):
+                        skipped += 1
+                        continue
+                    short = vdvno[:8]
+                    # 預期 file_ids（實際段數下載後才知，這裡回傳前綴供呼叫方參考）
+                    background_tasks.add_task(
+                        fetch_vod_background, vdvno, auto_mode, auto_diarize, auto_known_names
+                    )
+                    vods_queued.append({
+                        "vdvno": vdvno,
+                        "title": title,
+                        "file_id_prefix": f"vod_{short}_seg",
+                    })
+                    print(f"[auto] VOD 排入 {vdvno} ({title})")
+
+    return {
+        "live_started": live_started,
+        "vods_queued": vods_queued,
+        "skipped": skipped,
+    }
 
 
 if __name__ == "__main__":
