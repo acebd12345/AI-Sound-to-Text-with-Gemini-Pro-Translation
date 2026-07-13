@@ -456,8 +456,10 @@ async def run_translation_background(file_id, total_chunks, bucket):
 active_recordings: dict = {}
 
 # URL 白名單驗證（防止 SSRF）
+# 用 endswith 比對，"tcc.gov.tw" 涵蓋 live.tcc.gov.tw（直播）與
+# tccstr2.tcc.gov.tw（VOD 自家 HLS）等台北市議會網段。
 ALLOWED_STREAM_DOMAINS = [
-    "live.tcc.gov.tw",
+    "tcc.gov.tw",
 ]
 
 def _is_disallowed_ip(ip_str: str) -> bool:
