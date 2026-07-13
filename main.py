@@ -3,7 +3,9 @@ import re
 import json
 import time
 import random
+import socket
 import asyncio
+import ipaddress
 import opencc
 from urllib.parse import urljoin
 from dotenv import load_dotenv
@@ -248,17 +250,18 @@ async def check_status(file_id: str, total_chunks: int, background_tasks: Backgr
     
     # 1. 檢查 GPU 轉錄是否全部完成
     # 假設 GPU 轉完會存到 'transcripts/{file_id}_part_{i}.json'
-    transcripts = [None] * total_chunks
-    missing_parts = []
-    
-    for i in range(total_chunks):
-        blob_path = f"transcripts/{file_id}_part_{i}.json"
-        blob = bucket.blob(blob_path)
-        if not blob.exists():
-            missing_parts.append(i)
-        else:
-            # 暫存 blob 物件以便稍後下載
-            transcripts[i] = blob
+    # 用一次 list_blobs 取代對每個 chunk 的同步 exists()，並在 executor
+    # 執行以免 blocking IO 卡住 event loop
+    loop = asyncio.get_event_loop()
+    prefix = f"transcripts/{file_id}_part_"
+    existing_blobs = await loop.run_in_executor(
+        None, lambda: list(bucket.list_blobs(prefix=prefix))
+    )
+    existing_names = {b.name for b in existing_blobs}
+    missing_parts = [
+        i for i in range(total_chunks)
+        if f"transcripts/{file_id}_part_{i}.json" not in existing_names
+    ]
 
     if missing_parts:
         return {"status": "processing", "progress": f"等待轉錄中... 缺: {missing_parts}"}
@@ -458,6 +461,24 @@ ALLOWED_STREAM_DOMAINS = [
     "live.tcc.gov.tw",
 ]
 
+def _is_disallowed_ip(ip_str: str) -> bool:
+    """判斷 IP 是否指向不允許的內部/私有網段（含 GCP metadata server）"""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    # is_private 涵蓋 10.x / 172.16-31.x / 192.168.x；
+    # is_link_local 涵蓋 169.254.x（含 169.254.169.254 metadata server）
+    return (
+        ip.is_loopback
+        or ip.is_private
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
 def validate_stream_url(url: str) -> str:
     """驗證串流 URL，防止 SSRF 攻擊"""
     from urllib.parse import urlparse
@@ -466,6 +487,20 @@ def validate_stream_url(url: str) -> str:
         raise HTTPException(status_code=400, detail="僅支援 http/https URL")
     if not parsed.hostname:
         raise HTTPException(status_code=400, detail="無效的 URL")
+
+    # SSRF 防護：解析 hostname 後拒絕指向內網/loopback/link-local 的目標。
+    # hostname 本身是 IP 時直接判斷；是網域時用 getaddrinfo 解析後逐一檢查。
+    try:
+        ipaddress.ip_address(parsed.hostname)
+        resolved_ips = [parsed.hostname]
+    except ValueError:
+        try:
+            resolved_ips = [info[4][0] for info in socket.getaddrinfo(parsed.hostname, None)]
+        except socket.gaierror:
+            raise HTTPException(status_code=400, detail="無法解析主機名稱")
+    if any(_is_disallowed_ip(ip) for ip in resolved_ips):
+        raise HTTPException(status_code=400, detail="不允許指向內部/私有網段的位址")
+
     # 允許白名單內的網域，或 m3u8/直接串流 URL
     is_whitelisted = any(parsed.hostname.endswith(d) for d in ALLOWED_STREAM_DOMAINS)
     is_direct_stream = any(url.lower().endswith(ext) for ext in ['.m3u8', '.mp4', '.flv', '.ts'])
