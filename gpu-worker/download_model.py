@@ -12,9 +12,10 @@ if hf_token:
     print("Downloading pyannote speaker-diarization-3.1 model...")
     try:
         from pyannote.audio import Pipeline
+        from huggingface_hub import login
+        login(token=hf_token)
         pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1",
-            token=hf_token
+            "pyannote/speaker-diarization-3.1"
         )
         print("pyannote model downloaded successfully!")
     except Exception as e:

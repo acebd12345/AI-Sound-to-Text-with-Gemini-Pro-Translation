@@ -1,6 +1,7 @@
 import os
 import json
 import traceback
+import subprocess
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from faster_whisper import WhisperModel
@@ -30,14 +31,20 @@ if hf_token:
     try:
         import torch
         from pyannote.audio import Pipeline
-        diarization_pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1",
-            token=hf_token
+        # 設定 HF token (huggingface_hub 會自動從環境變數或 login() 讀取)
+        from huggingface_hub import login
+        login(token=hf_token)
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"CUDA not available (torch.version.cuda={torch.version.cuda})")
+        _pipeline = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1"
         )
-        diarization_pipeline.to(torch.device("cuda"))
+        _pipeline.to(torch.device("cuda"))
+        diarization_pipeline = _pipeline  # 只在完全成功後才設定
         print("pyannote 模型載入完成！")
     except Exception as e:
         print(f"pyannote 模型載入失敗 (講者辨識將不可用): {e}")
+        diarization_pipeline = None
 else:
     print("HF_TOKEN 未設定，講者辨識功能不可用。")
 
@@ -156,6 +163,15 @@ async def handle_event(request: Request):
         # 2. 下載檔案到暫存區 (/tmp)，用 file_id + chunk_index 確保路徑唯一
         local_input_path = f"/tmp/{file_id}_{chunk_index}"
         bucket = storage_client.bucket(bucket_name)
+
+        # 防止 Eventarc 重試時重複處理：檢查轉錄結果是否已存在
+        if len(path_parts) >= 3:
+            check_blob_name = f"transcripts/{file_id}_part_{chunk_index}.json"
+        else:
+            check_blob_name = f"transcripts/{file_name.replace('/', '_')}.json"
+        if bucket.blob(check_blob_name).exists():
+            print(f"轉錄結果已存在，跳過重複處理: {check_blob_name}")
+            return {"status": "already_exists", "output": check_blob_name}
         blob = bucket.blob(file_name)
         blob.download_to_filename(local_input_path)
 
@@ -211,11 +227,22 @@ async def handle_event(request: Request):
         if enable_diarize and diarization_pipeline is not None:
             print(f"執行講者辨識 (pyannote)...")
             try:
-                diarization_results = run_diarization(local_input_path)
+                # pyannote 不支援 WebM/Opus 等格式，先用 ffmpeg 轉成 WAV
+                wav_path = local_input_path + ".wav"
+                conv = subprocess.run(
+                    ["ffmpeg", "-y", "-i", local_input_path, "-ar", "16000", "-ac", "1", wav_path],
+                    capture_output=True, timeout=120
+                )
+                if conv.returncode != 0:
+                    raise RuntimeError(f"ffmpeg 轉檔失敗: {conv.stderr.decode()[-200:]}")
+                diarization_results = run_diarization(wav_path)
                 segment_list = assign_speakers_to_segments(segment_list, diarization_results)
                 print(f"講者辨識完成，共偵測到 {len(set(r[2] for r in diarization_results))} 位講者")
+                os.remove(wav_path)
             except Exception as e:
                 print(f"講者辨識失敗 (繼續不帶講者標籤): {e}")
+                if os.path.exists(local_input_path + ".wav"):
+                    os.remove(local_input_path + ".wav")
         elif enable_diarize:
             print("講者辨識已啟用但 pyannote 模型未載入 (HF_TOKEN 未設定?)")
 
