@@ -89,16 +89,30 @@ def _ssl_context() -> ssl.SSLContext:
     return ctx
 
 
+def _decode_json(raw: bytes):
+    """解析 JSON，容忍 BOM/UTF-16 與伺服器強制回傳的 gzip/deflate 壓縮。"""
+    import gzip
+    import zlib
+    candidates = [raw]
+    for fn in (gzip.decompress, zlib.decompress, lambda b: zlib.decompress(b, -15)):
+        try:
+            candidates.append(fn(raw))
+        except Exception:
+            pass
+    for data in candidates:
+        for enc in ("utf-8-sig", "utf-16", "utf-8"):
+            try:
+                return json.loads(data.decode(enc))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+    raise ValueError(f"無法解析回應: {raw[:200]!r}")
+
+
 def http_json(url: str, method: str = "GET", headers: dict = None, timeout: int = 30):
     req = urllib.request.Request(url, method=method, headers=headers or {})
     with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as resp:
         raw = resp.read()
-    for enc in ("utf-8-sig", "utf-16", "utf-8"):
-        try:
-            return json.loads(raw.decode(enc))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            continue
-    raise ValueError(f"無法解析回應: {raw[:200]!r}")
+    return _decode_json(raw)
 
 
 def backend(path: str, method: str = "GET", with_secret: bool = False, timeout: int = 60):
@@ -132,16 +146,20 @@ def _curl_json(url: str, headers: dict, timeout: int = 20):
 
 
 def portal(endpoint: str, params: dict = None):
-    """議會公開 API（唯讀、不帶任何密鑰），TLS 驗證失敗時退回 curl。"""
+    """議會公開 API（唯讀、不帶任何密鑰）。
+
+    優先走 curl（同時解決部分環境驗不過政府憑證鏈、與伺服器強制壓縮
+    兩個問題），沒有 curl 才用 urllib。"""
+    import shutil
     url = PORTAL_API + endpoint
     if params:
         url += "?" + urllib.parse.urlencode(params)
-    try:
-        return http_json(url, headers=PORTAL_HEADERS, timeout=20)
-    except (ssl.SSLError, urllib.error.URLError) as e:
-        if "CERTIFICATE_VERIFY_FAILED" not in str(e):
-            raise
-        return _curl_json(url, PORTAL_HEADERS)
+    if shutil.which("curl"):
+        try:
+            return _curl_json(url, PORTAL_HEADERS)
+        except Exception:
+            pass  # 退回 urllib 再試一次
+    return http_json(url, headers=PORTAL_HEADERS, timeout=20)
 
 
 # ---------- 子命令 ----------
