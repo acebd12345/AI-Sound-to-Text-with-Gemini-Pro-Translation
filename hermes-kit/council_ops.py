@@ -317,7 +317,9 @@ def cmd_mail(args):
     if not host:
         die("缺少 SMTP 設定（SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS/MAIL_FROM）")
     port = int(CFG.get("SMTP_PORT", "587"))
-    user, password = CFG.get("SMTP_USER", ""), CFG.get("SMTP_PASS", "")
+    user = CFG.get("SMTP_USER", "")
+    # Gmail 應用程式密碼顯示時帶空格但實際不含空格，貼上時常誤帶——自動去除
+    password = CFG.get("SMTP_PASS", "").replace(" ", "")
     sender = CFG.get("MAIL_FROM", user)
     recipients = [a.strip() for a in args.to.split(",") if a.strip()]
     if not recipients:
