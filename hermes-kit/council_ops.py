@@ -9,6 +9,7 @@
   status <file_id>              查單一 file_id 的轉錄翻譯進度
   wait <file_id...>             輪詢多個 file_id 直到全部完成（觸發翻譯靠這個）
   collect <輸出名> <file_id...>  等待+合併多切段字幕（時間軸自動位移），輸出 .srt/.txt
+  autostatus <vdvno>            查某 vdvno 的處理全貌（marker/session/失敗記錄）
   today                         今天的直播與 VOD 概況（議會公開 API）
   mail --to a@b --subject S --body B [--attach f ...]   寄信（SMTP）
 
@@ -177,9 +178,14 @@ def cmd_status(args):
     r = backend(f"/check_status/{urllib.parse.quote(args.file_id)}?total_chunks=1")
     # 完成時字幕內容很大，status 命令只回摘要；要拿內容用 collect
     if r.get("status") == "completed":
-        r = {"status": "completed",
-             "srt_chars": len(r.get("srt_text", "")),
-             "plain_chars": len(r.get("plain_text", ""))}
+        out = {"status": "completed",
+               "srt_chars": len(r.get("srt_text", "")),
+               "plain_chars": len(r.get("plain_text", ""))}
+        # 保留後端回傳的翻譯統計（若有）
+        for k in ("total_batches", "untranslated_batches"):
+            if r.get(k) is not None:
+                out[k] = r[k]
+        r = out
     print(json.dumps(r, ensure_ascii=False))
 
 
@@ -258,6 +264,8 @@ def cmd_collect(args):
     ordered = sorted(args.file_ids,
                      key=lambda f: int(SEG_NUM.search(f).group(1)) if SEG_NUM.search(f) else 0)
     srt_parts, txt_parts, missing = [], [], []
+    total_batches = 0
+    untranslated_batches = 0
     for fid in ordered:
         r = results.get(fid, {})
         if r.get("status") != "completed":
@@ -266,6 +274,9 @@ def cmd_collect(args):
         n = int(SEG_NUM.search(fid).group(1)) if SEG_NUM.search(fid) else 0
         srt_parts.append(_shift_srt(r.get("srt_text", ""), n * SEGMENT_SECONDS))
         txt_parts.append(r.get("plain_text", "").strip())
+        # 彙總各段翻譯統計（後端有回才累加）
+        total_batches += r.get("total_batches") or 0
+        untranslated_batches += r.get("untranslated_batches") or 0
 
     if not srt_parts:
         die(f"沒有任何切段完成: {missing}", 2)
@@ -281,9 +292,18 @@ def cmd_collect(args):
         "srt": str(srt_path), "txt": str(txt_path),
         "segments_done": len(srt_parts), "segments_missing": missing,
         "partial": bool(missing),
+        "total_batches": total_batches,
+        "untranslated_batches": untranslated_batches,
+        "partial_translation": untranslated_batches > 0,
     }, ensure_ascii=False, indent=1))
     if missing:
         sys.exit(2)
+
+
+def cmd_autostatus(args):
+    """查某 vdvno 的處理全貌（marker / session / 失敗記錄）。"""
+    r = backend(f"/auto_status/{urllib.parse.quote(args.vdvno)}", with_secret=True)
+    print(json.dumps(r, ensure_ascii=False, indent=1))
 
 
 def cmd_today(_args):
@@ -384,6 +404,10 @@ def main():
     p.add_argument("--interval", type=int, default=60)
     p.add_argument("--max-minutes", type=int, default=240)
     p.set_defaults(func=cmd_collect)
+
+    p = sub.add_parser("autostatus")
+    p.add_argument("vdvno")
+    p.set_defaults(func=cmd_autostatus)
 
     sub.add_parser("today").set_defaults(func=cmd_today)
 
