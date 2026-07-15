@@ -118,14 +118,16 @@ async def handle_event(request: Request):
             content={"status": "error", "message": "Whisper model not loaded. GPU environment may be unavailable."}
         )
 
-    # 1. 解析 CloudEvent 資料
-    event = await request.json()
-    
-    # 兼容性處理：Eventarc 的資料結構有時在 body，有時在 message.data
-    bucket_name = None
+    # 例外路徑需要清理暫存檔，故 file_name / local_input_path 先宣告於 try 外
     file_name = None
+    local_input_path = None
 
     try:
+        # 1. 解析 CloudEvent 資料
+        event = await request.json()
+
+        # 兼容性處理：Eventarc 的資料結構有時在 body，有時在 message.data
+        bucket_name = None
         if 'bucket' in event:
             bucket_name = event['bucket']
             file_name = event['name']
@@ -164,7 +166,10 @@ async def handle_event(request: Request):
         local_input_path = f"/tmp/{file_id}_{chunk_index}"
         bucket = storage_client.bucket(bucket_name)
 
-        # 防止 Eventarc 重試時重複處理：檢查轉錄結果是否已存在
+        # 防止 Eventarc 重試時重複處理：檢查轉錄結果是否已存在。
+        # 註：此檢查只防「完成後重送」，並非完整冪等保證——同一事件若並發於
+        # 不同 instance，兩者都可能在對方寫出前通過此檢查而重複轉錄。本次不
+        # 擴大處理（不加分散式鎖）。
         if len(path_parts) >= 3:
             check_blob_name = f"transcripts/{file_id}_part_{chunk_index}.json"
         else:
@@ -276,7 +281,23 @@ async def handle_event(request: Request):
     except Exception as e:
         error_msg = traceback.format_exc()
         print(f"處理發生錯誤: {error_msg}")
-        return {"status": "error", "message": str(e)}
+        # 清理暫存檔（含下載的音檔與轉出的 .wav）——否則反覆重試會累積塞爆磁碟
+        cleanup_paths = []
+        if local_input_path:
+            cleanup_paths += [local_input_path, local_input_path + ".wav"]
+        for p in cleanup_paths:
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+        # 回 500 讓 Eventarc/Pub/Sub 自動重試（exponential backoff），
+        # 而非回 200 dict 被視為成功、永不重試。
+        print(f"[轉錄失敗] {file_name}")
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e)},
+        )
 
 if __name__ == "__main__":
     import uvicorn
