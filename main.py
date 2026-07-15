@@ -1671,6 +1671,65 @@ async def auto_record_check(request: Request, background_tasks: BackgroundTasks)
     }
 
 
+def _read_auto_json_or_502(bucket, path: str):
+    """讀取 GCS JSON。**區分 NotFound 與其他錯誤**：
+    NotFound → 回 None（代表不存在）；權限/網路等真錯誤 → raise
+    HTTPException(502)，不得誤判成「不存在」。"""
+    from google.api_core.exceptions import NotFound
+    try:
+        return json.loads(bucket.blob(path).download_as_text())
+    except NotFound:
+        return None
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"GCS 讀取失敗（{path}）: {e}")
+
+
+@app.get("/auto_status/{vdvno}")
+async def auto_status(vdvno: str, request: Request):
+    """讓 Agent 查得到某 vdvno 的處理全貌（marker / session / 失敗記錄）。"""
+    # 驗證：與 /auto_record_check 相同的 X-Trigger-Secret 機制
+    expected = os.getenv("AUTO_TRIGGER_SECRET", "")
+    if not expected:
+        raise HTTPException(status_code=503, detail="自動錄製功能未啟用（AUTO_TRIGGER_SECRET 未設定）")
+    provided = request.headers.get("X-Trigger-Secret", "")
+    if not secrets.compare_digest(provided, expected):
+        raise HTTPException(status_code=403, detail="X-Trigger-Secret 驗證失敗")
+
+    # vdvno 字元檢查（與 validate_file_id 同級，防路徑注入）
+    if not vdvno or not FILE_ID_PATTERN.match(vdvno) or ".." in vdvno:
+        raise HTTPException(status_code=400, detail="Invalid vdvno")
+
+    bucket = storage_client.bucket(BUCKET_NAME)
+    vod_marker = _read_auto_json_or_502(bucket, f"auto_state/vod/{vdvno}")
+    live_marker = _read_auto_json_or_502(bucket, f"auto_state/live/{vdvno}")
+    vod_failure = _read_auto_json_or_502(bucket, f"auto_state/vod_failures/{vdvno}")
+    live_failure = _read_auto_json_or_502(bucket, f"auto_state/live_failures/{vdvno}")
+
+    # session 查找順序：live_marker.session_id → live_failure.session_id
+    # （marker 已被釋放時仍能回查最後 session，見⑤）
+    sess_id = (live_marker or {}).get("session_id") or (live_failure or {}).get("session_id")
+    session = _read_auto_json_or_502(bucket, f"auto_state/sessions/{sess_id}") if sess_id else None
+
+    result = {"now_taiwan": _now_taiwan_str()}
+    present = False
+    for key, val in (
+        ("vod_marker", vod_marker),
+        ("live_marker", live_marker),
+        ("session", session),
+        ("vod_failure", vod_failure),
+        ("live_failure", live_failure),
+    ):
+        if val is not None:
+            result[key] = val
+            present = True
+
+    if not present:
+        raise HTTPException(status_code=404, detail="查無此 vdvno 的任何處理記錄")
+    return result
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
