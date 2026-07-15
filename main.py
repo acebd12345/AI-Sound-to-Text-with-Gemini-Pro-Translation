@@ -481,6 +481,20 @@ def _is_disallowed_ip(ip_str: str) -> bool:
     )
 
 
+def is_vod_url(url: str) -> bool:
+    """判斷串流 URL 是否為 VOD（錄影檔）。
+
+    議會 VOD 的 HLS 路徑含 /tccvod/（不分大小寫），例如
+    https://tccstr2.tcc.gov.tw/tccvod/smil:room304_...smil/playlist.m3u8。
+    VOD 會被 ffmpeg 全速讀完，若誤進 recording_loop（為直播設計）會
+    造成重連重錄開頭的失控迴圈，故須在入口擋下。
+    """
+    return "/tccvod/" in (url or "").lower()
+
+
+VOD_REJECT_DETAIL = "此網址為 VOD（錄影檔），請使用 VOD 下載流程，不可用直播錄製"
+
+
 def validate_stream_url(url: str) -> str:
     """驗證串流 URL，防止 SSRF 攻擊"""
     from urllib.parse import urlparse
@@ -737,6 +751,10 @@ async def start_recording(req: StartRecordingRequest, background_tasks: Backgrou
         # 嘗試用 yt-dlp 提取
         validate_stream_url(stream_url)
         stream_url = await get_stream_url(stream_url)
+
+    # 入口防護：VOD（錄影檔）網址不可進入直播錄製迴圈
+    if is_vod_url(stream_url):
+        raise HTTPException(status_code=400, detail=VOD_REJECT_DETAIL)
 
     # 驗證 ffmpeg 能否連上串流
     probe_proc = await asyncio.create_subprocess_exec(
@@ -1231,6 +1249,13 @@ async def auto_record_check(request: Request, background_tasks: BackgroundTasks)
             video_page_url = urljoin(ISHARE_REFERER, f"VideoData.aspx?vdvno={vdvno}")
             stream_url = await get_stream_url(video_page_url)
             validate_stream_url(stream_url)
+
+            # 入口防護：解析出來的若是 VOD 網址，跳過（釋放 marker、記入 skipped）
+            if is_vod_url(stream_url):
+                print(f"[auto] 直播 {vdvno} 解析為 VOD 網址，跳過: {stream_url}")
+                release_auto_state(bucket, "live", vdvno)
+                skipped += 1
+                continue
 
             suffix = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=6))
             session_id = f"rec_{int(time.time())}_{suffix}"
