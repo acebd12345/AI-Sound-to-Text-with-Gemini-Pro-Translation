@@ -2,6 +2,10 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
+# print 即時 flush，否則 Cloud Run 日誌的 timestamp 全是 flush 時間，
+# 事故時序無法還原。
+ENV PYTHONUNBUFFERED=1
+
 # 安裝系統依賴
 RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 
