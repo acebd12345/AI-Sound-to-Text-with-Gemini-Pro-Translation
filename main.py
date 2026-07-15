@@ -864,7 +864,16 @@ async def recording_status(session_id: str):
     """查詢錄製狀態"""
     rec = active_recordings.get(session_id)
     if not rec:
-        raise HTTPException(status_code=404, detail="錄製 session 不存在")
+        # 記憶體查不到時改查 GCS 落地狀態——讓「實例重啟導致錄製中斷」
+        # 變成可見狀態，而非 404 消失。
+        try:
+            bucket = storage_client.bucket(BUCKET_NAME)
+            blob = bucket.blob(f"auto_state/sessions/{session_id}")
+            landed = json.loads(blob.download_as_text())
+            landed["note"] = "instance restarted, session terminated"
+            return landed
+        except Exception:
+            raise HTTPException(status_code=404, detail="錄製 session 不存在")
 
     elapsed = time.time() - rec["started_at"]
     return {
@@ -886,6 +895,24 @@ RUNAWAY_CONSECUTIVE_LIMIT = 2
 
 # 單一 session 段數上限：40 段 = 20 小時，超過議會單日任何會議長度。
 MAX_SEGMENTS_PER_SESSION = 40
+
+
+def _write_session_state(bucket, session_id: str, rec: dict) -> None:
+    """把錄製 session 摘要覆寫式落地 GCS（best-effort，不用鎖、不拋例外）。
+    讓「實例重啟導致錄製中斷」變成可見狀態，而非 /recording_status 404 消失。
+    """
+    try:
+        blob = bucket.blob(f"auto_state/sessions/{session_id}")
+        blob.upload_from_string(json.dumps({
+            "status": rec.get("status"),
+            "title": rec.get("title"),
+            "segments": len(rec.get("segments", [])),
+            "error": rec.get("error"),
+            "updated_at": time.time(),
+        }))
+    except Exception as e:
+        print(f"[session_state] 寫入 {session_id} 失敗: {e}")
+
 
 async def recording_loop(session_id, stream_url, mode, diarize, known_names):
     """背景任務：持續錄製串流，每 30 分鐘切一段上傳"""
@@ -986,6 +1013,9 @@ async def recording_loop(session_id, stream_url, mode, diarize, known_names):
             })
             print(f"[錄製] {session_id} 第 {segment_num} 段已上傳 (file_id={file_id})")
 
+            # 每完成一段，落地 session 狀態
+            _write_session_state(bucket, session_id, rec)
+
             segment_num += 1
 
             # 如果 ffmpeg 被 terminate 了（用戶按停止），不繼續
@@ -998,6 +1028,8 @@ async def recording_loop(session_id, stream_url, mode, diarize, known_names):
     finally:
         rec["status"] = "stopped"
         rec.pop("_ffmpeg_proc", None)
+        # 結束/出錯時落地最後狀態
+        _write_session_state(bucket, session_id, rec)
         print(f"[錄製] {session_id} 錄製結束，共 {len(rec['segments'])} 段")
 
 
