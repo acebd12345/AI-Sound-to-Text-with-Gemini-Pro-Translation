@@ -1084,6 +1084,41 @@ def release_auto_state(bucket, kind: str, vdvno: str) -> None:
         pass
 
 
+# --- VOD 失敗原因落地（治「卡位假象」）---
+# 路徑：auto_state/vod_failures/{vdvno}
+# fetch_vod_background 失敗釋放 marker 前寫入失敗原因，成功完成時刪除。
+# /auto_record_check 掃描時附在 vods_queued 該筆的 last_failure，讓呼叫方
+# （Hermes）能如實回報上次失敗原因，而非誤以為一切正常。
+
+def _record_vod_failure(bucket, vdvno: str, reason: str, detail: str = "") -> None:
+    """覆寫式記錄 VOD 失敗原因（best-effort，不拋例外）。"""
+    try:
+        blob = bucket.blob(f"auto_state/vod_failures/{vdvno}")
+        blob.upload_from_string(json.dumps({
+            "reason": reason,
+            "at": time.time(),
+            "detail": detail,
+        }))
+    except Exception as e:
+        print(f"[vod_failure] 寫入 {vdvno} 失敗: {e}")
+
+
+def _clear_vod_failure(bucket, vdvno: str) -> None:
+    """成功完成時刪除失敗記錄。"""
+    try:
+        bucket.blob(f"auto_state/vod_failures/{vdvno}").delete()
+    except Exception:
+        pass
+
+
+def _read_vod_failure(bucket, vdvno: str):
+    """讀取 VOD 失敗記錄（無則回 None）。"""
+    try:
+        return json.loads(bucket.blob(f"auto_state/vod_failures/{vdvno}").download_as_text())
+    except Exception:
+        return None
+
+
 # --- 自動錄製：VOD 下載函式（核心新功能） ---
 VOD_DOWNLOAD_TIMEOUT = 3600  # 整體下載+切段的 timeout（秒）
 
@@ -1173,6 +1208,7 @@ async def fetch_vod_background(vdvno: str, mode: str, diarize: bool, known_names
         stream_url, title = await _resolve_vod_stream(vdvno)
         if not stream_url:
             print(f"[VOD] {vdvno} 無法解析串流 URL，放棄")
+            _record_vod_failure(bucket, vdvno, "無法解析串流 URL")
             release_auto_state(bucket, "vod", vdvno)
             return
 
@@ -1181,6 +1217,9 @@ async def fetch_vod_background(vdvno: str, mode: str, diarize: bool, known_names
             validate_stream_url(stream_url)
         except HTTPException as e:
             print(f"[VOD] {vdvno} 串流 URL 驗證失敗: {e.detail}")
+            is_yt = "youtube.com" in stream_url or "youtu.be" in stream_url
+            reason = "官方尚未上架 HLS（YouTube URL）" if is_yt else "串流 URL 驗證失敗"
+            _record_vod_failure(bucket, vdvno, reason, detail=str(e.detail))
             release_auto_state(bucket, "vod", vdvno)
             return
 
@@ -1213,6 +1252,7 @@ async def fetch_vod_background(vdvno: str, mode: str, diarize: bool, known_names
             except Exception:
                 pass
             _cleanup_local()
+            _record_vod_failure(bucket, vdvno, "下載超時", detail=f"{VOD_DOWNLOAD_TIMEOUT}s")
             release_auto_state(bucket, "vod", vdvno)
             return
 
@@ -1226,6 +1266,7 @@ async def fetch_vod_background(vdvno: str, mode: str, diarize: bool, known_names
         if not seg_files:
             print(f"[VOD] {vdvno} 未產生有效切段，放棄")
             _cleanup_local()
+            _record_vod_failure(bucket, vdvno, "未產生有效切段")
             release_auto_state(bucket, "vod", vdvno)
             return
 
@@ -1257,11 +1298,13 @@ async def fetch_vod_background(vdvno: str, mode: str, diarize: bool, known_names
             total_segments=len(file_ids),
             status="uploaded",
         )
+        _clear_vod_failure(bucket, vdvno)
         print(f"[VOD] {vdvno} 完成，共 {len(file_ids)} 段進管線")
 
     except Exception as e:
         print(f"[VOD] {vdvno} 下載失敗: {e}")
         _cleanup_local()
+        _record_vod_failure(bucket, vdvno, "下載失敗", detail=str(e))
         release_auto_state(bucket, "vod", vdvno)
 
 
@@ -1294,6 +1337,13 @@ def _tw_dates_today_yesterday() -> list:
     today = now.strftime("%Y/%m/%d")
     yesterday = (now - timedelta(days=1)).strftime("%Y/%m/%d")
     return [today, yesterday]
+
+
+def _now_taiwan_str() -> str:
+    """回傳台灣時區（UTC+8）目前時間字串 YYYY/MM/DD HH:MM，供 Agent 對時。"""
+    from datetime import datetime, timezone, timedelta
+    tw_tz = timezone(timedelta(hours=8))
+    return datetime.now(tw_tz).strftime("%Y/%m/%d %H:%M")
 
 
 @app.post("/auto_record_check")
@@ -1411,21 +1461,27 @@ async def auto_record_check(request: Request, background_tasks: BackgroundTasks)
                         skipped += 1
                         continue
                     short = vdvno[:8]
+                    # 排入前若該 vdvno 有上次失敗記錄，附在回傳物件供 Hermes 如實回報
+                    last_failure = _read_vod_failure(bucket, vdvno)
                     # 預期 file_ids（實際段數下載後才知，這裡回傳前綴供呼叫方參考）
                     background_tasks.add_task(
                         fetch_vod_background, vdvno, auto_mode, auto_diarize, auto_known_names
                     )
-                    vods_queued.append({
+                    queued_entry = {
                         "vdvno": vdvno,
                         "title": title,
                         "file_id_prefix": f"vod_{short}_seg",
-                    })
+                    }
+                    if last_failure:
+                        queued_entry["last_failure"] = last_failure
+                    vods_queued.append(queued_entry)
                     print(f"[auto] VOD 排入 {vdvno} ({title})")
 
     return {
         "live_started": live_started,
         "vods_queued": vods_queued,
         "skipped": skipped,
+        "now_taiwan": _now_taiwan_str(),
     }
 
 
