@@ -843,18 +843,36 @@ async def recording_status(session_id: str):
 
 SEGMENT_DURATION = 1800  # 30 分鐘
 
+# 失控煞車：正常直播每段須錄滿約 30 分鐘牆鐘時間。若一段在牆鐘 < 300 秒
+# 就完成（有效檔案但完成太快，典型為 VOD 全速讀完或斷流重連循環），連續
+# 2 段即判定失控並自動停止。
+RUNAWAY_SEGMENT_SECONDS = 300
+RUNAWAY_CONSECUTIVE_LIMIT = 2
+
+# 單一 session 段數上限：40 段 = 20 小時，超過議會單日任何會議長度。
+MAX_SEGMENTS_PER_SESSION = 40
+
 async def recording_loop(session_id, stream_url, mode, diarize, known_names):
     """背景任務：持續錄製串流，每 30 分鐘切一段上傳"""
     rec = active_recordings[session_id]
     segment_num = 0
+    fast_segment_streak = 0  # 連續「牆鐘過快完成」的段數
     bucket = storage_client.bucket(BUCKET_NAME)
 
     try:
         while not rec["stop"]:
+            # 段數上限保護：達上限自動停止
+            if segment_num >= MAX_SEGMENTS_PER_SESSION:
+                print(f"[錄製] {session_id} 已達段數上限 {MAX_SEGMENTS_PER_SESSION}，自動停止")
+                rec["stop"] = True
+                rec["error"] = f"已達單一 session 段數上限（{MAX_SEGMENTS_PER_SESSION} 段 / 20 小時），已自動停止"
+                break
+
             file_id = f"{session_id}_seg{segment_num}"
             local_path = f"/tmp/{file_id}.wav"
 
             print(f"[錄製] {session_id} 開始錄製第 {segment_num} 段...")
+            seg_wall_start = time.time()
 
             # ffmpeg 錄製 30 分鐘（-vn 去影片，轉 16kHz mono WAV 給 Whisper）
             # 加上 headers 以支援需要 Referer 的串流平台
@@ -890,6 +908,24 @@ async def recording_loop(session_id, stream_url, mode, diarize, known_names):
                     os.remove(local_path)
                 rec["error"] = f"串流已結束或錄製失敗（檔案 {file_size} bytes）"
                 break
+
+            # 失控煞車：檔案有效但牆鐘完成太快（直播不可能 25 秒錄完 30 分鐘）。
+            # 連續 RUNAWAY_CONSECUTIVE_LIMIT 段皆過快 → 判定失控，立即停止。
+            seg_wall_elapsed = time.time() - seg_wall_start
+            if seg_wall_elapsed < RUNAWAY_SEGMENT_SECONDS:
+                fast_segment_streak += 1
+                print(f"[錄製] {session_id} 第 {segment_num} 段牆鐘僅 {seg_wall_elapsed:.1f}s 完成"
+                      f"（連續第 {fast_segment_streak} 段過快）")
+                if fast_segment_streak >= RUNAWAY_CONSECUTIVE_LIMIT:
+                    print(f"[失控偵測] {session_id} 連續 {fast_segment_streak} 段在牆鐘 "
+                          f"< {RUNAWAY_SEGMENT_SECONDS}s 完成，疑似 VOD 或斷流循環，自動停止")
+                    rec["stop"] = True
+                    rec["error"] = "失控偵測：段完成速度異常（疑似 VOD 或斷流循環），已自動停止"
+                    if os.path.exists(local_path):
+                        os.remove(local_path)
+                    break
+            else:
+                fast_segment_streak = 0
 
             print(f"[錄製] {session_id} 第 {segment_num} 段錄製完成，上傳至 GCS...")
 
