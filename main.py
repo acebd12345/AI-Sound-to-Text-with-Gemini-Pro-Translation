@@ -618,9 +618,30 @@ async def extract_live_streams(list_url: str) -> list:
     return lives
 
 
+class StreamExtractError(Exception):
+    """串流提取最終失敗時拋出，帶實際嘗試的來源資訊供上層分類/落地。
+
+    對外的 HTTP 端點（/start_recording 等）會 catch 後轉回 HTTPException(400)，
+    對外行為不變；內部（自動掃描）則用 source_type 分類失敗原因。
+    """
+    def __init__(self, detail: str, source_url: str = "", source_type: str = "unknown"):
+        super().__init__(detail)
+        self.detail = detail
+        self.source_url = source_url            # 實際嘗試的 URL（如解析出的 YouTube URL）
+        self.source_type = source_type          # "youtube" | "hls" | "unknown"
+
+
 async def get_stream_url(video_page_url: str) -> str:
-    """從 iShare Portal 影片頁面提取串流 URL"""
+    """從 iShare Portal 影片頁面提取串流 URL。
+
+    最終失敗時 raise StreamExtractError（帶實際嘗試的來源 URL 與類型），
+    保留原本的 detail 文案；對外端點會轉回 HTTPException(400)。
+    """
     from urllib.parse import urlparse, parse_qs
+
+    # 追蹤實際嘗試的來源（供失敗時分類，如 YouTube 直播無法後端錄製）
+    src_url = ""
+    src_type = "unknown"
 
     # 方法 1: 如果是 iShare VideoData 頁面，呼叫 SPW010 API 取得串流 URL
     if "VideoData.aspx" in video_page_url and "vdvno=" in video_page_url:
@@ -647,9 +668,11 @@ async def get_stream_url(video_page_url: str) -> str:
                     stream = url_list[0].get("src", "") if isinstance(url_list[0], dict) else str(url_list[0])
                     if stream:
                         print(f"[串流提取] 從 VideoURLList 取得: {stream}")
-                        # YouTube URL 需要 yt-dlp 轉換
+                        # YouTube URL 需要 yt-dlp 轉換（記下來源，失敗時可分類）
                         if "youtube.com" in stream or "youtu.be" in stream:
+                            src_url, src_type = stream, "youtube"
                             return await _ytdlp_extract(stream)
+                        src_url, src_type = stream, "hls"
                         return stream
                 # 其次用 vdv_url
                 vdv_url = data.get("vdv_url", "")
@@ -657,14 +680,24 @@ async def get_stream_url(video_page_url: str) -> str:
                     print(f"[串流提取] 從 vdv_url 取得: {vdv_url}")
                     # YouTube URL 需要 yt-dlp 轉換
                     if "youtube.com" in vdv_url or "youtu.be" in vdv_url:
+                        src_url, src_type = vdv_url, "youtube"
                         return await _ytdlp_extract(vdv_url)
+                    src_url, src_type = vdv_url, "hls"
                     return vdv_url
+            except HTTPException:
+                # yt-dlp 提取失敗（HTTPException）：已記下 src_url/src_type，落到最終分類
+                pass
             except Exception as e:
                 print(f"[串流提取] iShare API 失敗: {e}")
 
     # 方法 2: 如果是 YouTube URL，直接用 yt-dlp
     if "youtube.com" in video_page_url or "youtu.be" in video_page_url:
-        return await _ytdlp_extract(video_page_url)
+        if not src_url:
+            src_url, src_type = video_page_url, "youtube"
+        try:
+            return await _ytdlp_extract(video_page_url)
+        except HTTPException:
+            pass  # 落到最終 StreamExtractError
 
     # 方法 3: 爬網頁找 m3u8
     try:
@@ -685,9 +718,10 @@ async def get_stream_url(video_page_url: str) -> str:
     except Exception:
         pass
 
-    raise HTTPException(
-        status_code=400,
-        detail="無法自動提取串流 URL。請從瀏覽器 F12 → Network 找到 .m3u8 網址，使用「直接錄製」。"
+    raise StreamExtractError(
+        "無法自動提取串流 URL。請從瀏覽器 F12 → Network 找到 .m3u8 網址，使用「直接錄製」。",
+        source_url=src_url,
+        source_type=src_type,
     )
 
 
@@ -777,14 +811,16 @@ async def start_recording(req: StartRecordingRequest, background_tasks: Backgrou
     stream_url = req.stream_url
 
     # 判斷 URL 類型：如果是影片頁面（非直接串流），先用 yt-dlp 提取
+    # get_stream_url 失敗會 raise StreamExtractError，這裡轉回 HTTPException(400)，
+    # 對外行為與重構前一致（原本就是回 400）。
     is_direct_stream = any(stream_url.lower().endswith(ext) for ext in ['.m3u8', '.mp4', '.flv', '.ts'])
-    if not is_direct_stream and 'VideoData.aspx' in stream_url:
+    if not is_direct_stream:
+        # 影片頁面（VideoData.aspx）或其他非直接串流皆走 get_stream_url 提取
         validate_stream_url(stream_url)
-        stream_url = await get_stream_url(stream_url)
-    elif not is_direct_stream:
-        # 嘗試用 yt-dlp 提取
-        validate_stream_url(stream_url)
-        stream_url = await get_stream_url(stream_url)
+        try:
+            stream_url = await get_stream_url(stream_url)
+        except StreamExtractError as e:
+            raise HTTPException(status_code=400, detail=e.detail)
 
     # 入口防護：VOD（錄影檔）網址不可進入直播錄製迴圈
     if is_vod_url(stream_url):
@@ -1030,6 +1066,26 @@ async def recording_loop(session_id, stream_url, mode, diarize, known_names):
         rec.pop("_ffmpeg_proc", None)
         # 結束/出錯時落地最後狀態
         _write_session_state(bucket, session_id, rec)
+
+        # ⑤：auto session（帶 auto_vdvno）的 marker 生命週期處理
+        auto_vdvno = rec.get("auto_vdvno")
+        if auto_vdvno:
+            # a. 若錄製中斷有 error：先寫 live_failures，再處理 marker
+            if rec.get("error"):
+                _record_live_failure(
+                    bucket, auto_vdvno,
+                    reason=f"錄製中斷：{rec['error']}",
+                    detail=rec.get("error", ""),
+                    source_type="hls",
+                    source_url=rec.get("stream_url", ""),
+                    session_id=session_id,
+                )
+            # b. 釋放 marker 前先讀取內容：僅當 marker.session_id == 本 session_id
+            #    才用讀到的 generation 條件刪除，避免誤刪其他新 session 的 marker。
+            marker, gen = _read_marker(bucket, "live", auto_vdvno)
+            if marker and marker.get("session_id") == session_id and gen is not None:
+                _conditional_delete_marker(bucket, "live", auto_vdvno, gen)
+
         print(f"[錄製] {session_id} 錄製結束，共 {len(rec['segments'])} 段")
 
 
@@ -1117,6 +1173,101 @@ def _read_vod_failure(bucket, vdvno: str):
         return json.loads(bucket.blob(f"auto_state/vod_failures/{vdvno}").download_as_text())
     except Exception:
         return None
+
+
+# --- 直播失敗原因落地（路徑：auto_state/live_failures/{vdvno}）---
+# 直播開錄失敗（含 StreamExtractError）或 auto session 錄製中斷時寫入，
+# 讓 /auto_record_check 的 live_failed 與 /auto_status 能如實回報。成功開錄
+# 或成功結束時刪除。
+
+def _record_live_failure(bucket, vdvno: str, reason: str, detail: str = "",
+                         source_type: str = "unknown", source_url: str = "",
+                         session_id: str = None) -> dict:
+    """覆寫式記錄直播失敗原因（best-effort）。回傳寫入的內容供上層附到 live_failed。"""
+    payload = {
+        "reason": reason,
+        "detail": detail,
+        "source_type": source_type,
+        "source_url": source_url,
+        "session_id": session_id,
+        "at": time.time(),
+    }
+    try:
+        bucket.blob(f"auto_state/live_failures/{vdvno}").upload_from_string(json.dumps(payload))
+    except Exception as e:
+        print(f"[live_failure] 寫入 {vdvno} 失敗: {e}")
+    return payload
+
+
+def _clear_live_failure(bucket, vdvno: str) -> None:
+    """成功開錄時刪除失敗記錄。"""
+    try:
+        bucket.blob(f"auto_state/live_failures/{vdvno}").delete()
+    except Exception:
+        pass
+
+
+def _read_live_failure(bucket, vdvno: str):
+    """讀取直播失敗記錄（無則回 None）。"""
+    try:
+        return json.loads(bucket.blob(f"auto_state/live_failures/{vdvno}").download_as_text())
+    except Exception:
+        return None
+
+
+# --- marker 生命週期輔助（供 ⑤ 直播 marker 回收與條件刪除）---
+
+def _read_marker(bucket, kind: str, vdvno: str):
+    """讀取 marker 內容與其 generation。回傳 (data_dict, generation)；不存在回 (None, None)。"""
+    try:
+        blob = bucket.get_blob(_auto_state_path(kind, vdvno))
+        if blob is None:
+            return None, None
+        return json.loads(blob.download_as_text()), blob.generation
+    except Exception:
+        return None, None
+
+
+def _conditional_delete_marker(bucket, kind: str, vdvno: str, generation) -> bool:
+    """以讀到的 generation 做條件刪除，防止誤刪其他新 session 剛建立的 marker。
+    刪除成功回 True；generation 不符（別人動過）或已不存在回 False。"""
+    from google.api_core.exceptions import NotFound
+    try:
+        bucket.blob(_auto_state_path(kind, vdvno)).delete(if_generation_match=generation)
+        return True
+    except (PreconditionFailed, NotFound):
+        return False
+    except Exception as e:
+        print(f"[marker] 條件刪除 {kind}/{vdvno} 失敗: {e}")
+        return False
+
+
+def _read_session_state(bucket, session_id: str):
+    """讀取 auto_state/sessions/{session_id}（不存在回 None）。"""
+    if not session_id:
+        return None
+    try:
+        blob = bucket.get_blob(f"auto_state/sessions/{session_id}")
+        if blob is None:
+            return None
+        return json.loads(blob.download_as_text())
+    except Exception:
+        return None
+
+
+def _is_stale_live_marker(bucket, marker: dict) -> bool:
+    """判斷直播 marker 是否陳舊（防實例重啟時 finally 沒跑）：
+    - session_id 對應的 sessions 檔顯示 status == "stopped"，或
+    - sessions 檔不存在且 marker.started_at 距今 > 3600 秒。
+    """
+    if not marker:
+        return False
+    sess_id = marker.get("session_id")
+    if sess_id:
+        state = _read_session_state(bucket, sess_id)
+        if state is not None:
+            return state.get("status") == "stopped"
+    return (time.time() - marker.get("started_at", 0)) > 3600
 
 
 # --- 自動錄製：VOD 下載函式（核心新功能） ---
@@ -1364,6 +1515,7 @@ async def auto_record_check(request: Request, background_tasks: BackgroundTasks)
 
     bucket = storage_client.bucket(BUCKET_NAME)
     live_started = []
+    live_failed = []        # 本輪失敗＋既有 live_failures 仍在直播清單者（供 Hermes 判讀）
     vods_queued = []
     skipped = 0
 
@@ -1394,13 +1546,32 @@ async def auto_record_check(request: Request, background_tasks: BackgroundTasks)
             skipped += 1
             continue
         title = item.get("vdv_title", "") or item.get("vdt_title", "") or "直播錄製"
-        if not claim_auto_state(bucket, "live", vdvno, title):
-            skipped += 1
-            continue
+
+        # 搶鎖；搶不到時檢查是否為陳舊 marker（⑤：防實例重啟後半場沒人錄）
+        claimed = claim_auto_state(bucket, "live", vdvno, title)
+        if not claimed:
+            marker, gen = _read_marker(bucket, "live", vdvno)
+            if _is_stale_live_marker(bucket, marker) and gen is not None:
+                # 用讀 marker 時的 generation 做條件刪除，刪成功才 re-claim；
+                # 失敗（generation 不符＝別人剛動過）本輪跳過該場。
+                if _conditional_delete_marker(bucket, "live", vdvno, gen):
+                    print(f"[marker回收] live {vdvno} 回收陳舊 marker，重新開錄")
+                    claimed = claim_auto_state(bucket, "live", vdvno, title)
+                else:
+                    print(f"[marker回收] live {vdvno} 條件刪除失敗（generation 不符），本輪跳過")
+            if not claimed:
+                # 仍在處理中或回收失敗：既有失敗記錄且仍在直播清單 → 附上供回報
+                existing_lf = _read_live_failure(bucket, vdvno)
+                if existing_lf:
+                    live_failed.append({"vdvno": vdvno, "title": title, "last_failure": existing_lf})
+                skipped += 1
+                continue
+
         # 開錄：走既有 get_stream_url + recording_loop
+        session_id = None
         try:
             video_page_url = urljoin(ISHARE_REFERER, f"VideoData.aspx?vdvno={vdvno}")
-            stream_url = await get_stream_url(video_page_url)
+            stream_url = await get_stream_url(video_page_url)  # 失敗 raise StreamExtractError
             validate_stream_url(stream_url)
 
             # 入口防護：解析出來的若是 VOD 網址，跳過（釋放 marker、記入 skipped）
@@ -1430,11 +1601,25 @@ async def auto_record_check(request: Request, background_tasks: BackgroundTasks)
                 auto_mode, auto_diarize, auto_known_names
             )
             update_auto_state(bucket, "live", vdvno, session_id=session_id, status="recording")
+            _clear_live_failure(bucket, vdvno)  # 成功開錄 → 清除舊失敗記錄
             live_started.append({"vdvno": vdvno, "title": title, "session_id": session_id})
             print(f"[auto] 直播開錄 {vdvno} ({title}) → {session_id}")
         except Exception as e:
-            print(f"[auto] 直播 {vdvno} 開錄失敗: {e}")
+            # ①：失敗原因分類並落地。StreamExtractError 帶 source_type/source_url。
+            source_type = getattr(e, "source_type", "unknown")
+            source_url = getattr(e, "source_url", "")
+            detail = getattr(e, "detail", str(e))
+            if source_type == "youtube":
+                reason = "YouTube 直播無法後端錄製"
+            else:
+                reason = f"開錄失敗：{detail}"
+            print(f"[auto] 直播 {vdvno} 開錄失敗: {reason}")
+            lf = _record_live_failure(
+                bucket, vdvno, reason, detail=detail,
+                source_type=source_type, source_url=source_url, session_id=session_id,
+            )
             release_auto_state(bucket, "live", vdvno)
+            live_failed.append({"vdvno": vdvno, "title": title, "last_failure": lf})
             skipped += 1
 
     # 3. VOD 掃描：SPW002 拿頻道，逐頻道逐日期打 SPW046
@@ -1479,6 +1664,7 @@ async def auto_record_check(request: Request, background_tasks: BackgroundTasks)
 
     return {
         "live_started": live_started,
+        "live_failed": live_failed,
         "vods_queued": vods_queued,
         "skipped": skipped,
         "now_taiwan": _now_taiwan_str(),
