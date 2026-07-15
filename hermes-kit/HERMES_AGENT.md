@@ -18,6 +18,7 @@
 | `status <file_id>` | 查單一切段進度 | 抽查 |
 | `wait <file_id...>` | 等多個切段全部完成（**輪詢即觸發翻譯，必跑**） | trigger 回傳 file_ids 之後 |
 | `collect <名稱> <file_id...>` | 等待+合併切段字幕（時間軸自動接續），輸出 output/<名稱>.srt 和 .txt | 準備寄結果前 |
+| `autostatus <vdvno>` | 查某 vdvno 的處理全貌（marker/session/失敗記錄），含 `vod_marker.file_ids` | trigger 排入 VOD 後，輪詢確認段數 |
 | `mail --to ... --subject ... --body ... --attach ...` | 寄信 | 寄結果、警報、日報 |
 
 ## 值班流程
@@ -46,11 +47,14 @@
     把正式影片檔上傳，系統會自動重試，屬正常等待，不是故障）。
     回報進度時**如實引用此欄位**，不要自行推測狀態。
 - `trigger` 回傳的處理方式：
-  - `vods_queued` 有東西 → 對每筆記下 title 與 file_ids。VOD 切段數
-    下載完才確定，先 `wait` 已知的 file_ids；若 `_seg0` 完成，主動猜測
-    並檢查 `_seg1`、`_seg2`…（`status` 查到 404/缺件為止）。
-  - `live_started` 有東西 → 不需額外動作，錄製中的
-    session 系統自己管；其切段 file_id 會在後續掃描中變成可查狀態。
+  - `vods_queued` 有東西 → 對每筆記下 `vdvno` 與 title。VOD 切段數要下載
+    切段完成才確定，**不要用 `status` 猜測 seg0、seg1…**（`check_status`
+    永遠不回 404，猜測會卡死）。正確做法：用 `autostatus <vdvno>` 輪詢，
+    **等 `vod_marker.file_ids` 非空**（代表下載切段完成、段數已確定），再
+    對那些 file_id 執行 `wait` / `collect`。
+  - `live_started` 有東西 → 不需額外動作，錄製中的 session 系統自己管；
+    其切段 file_id 會在後續掃描中變成可查狀態。
+  - `live_failed` 有東西 → 見「異常處置」第 7 點分類處理。
 
 ### 結果交付（每完成一場會議，**完成即寄、絕不積批**）
 字幕一旦全部完成就立刻走以下流程寄出，不等下一個檢查點、不等日報、
@@ -62,6 +66,11 @@
    - 附件：collect 產出的 .srt 和 .txt
 3. `collect` 回傳 `partial: true` 時照寄，但主旨加註「(部分結果)」，
    並在內文說明缺哪幾段。
+4. `collect` 回傳 `partial_translation: true`（即 `untranslated_batches > 0`）
+   時照寄，但主旨加註「(含未翻譯段落)」，內文說明未翻譯段數
+   （`untranslated_batches`／`total_batches`）——這些段落已附原文，只是
+   翻譯降級，不是缺件。若同時 `partial` 與 `partial_translation`，兩個註記
+   都加。
 
 ### 每日日報（22:00，寄管理者 ADMIN_EMAILS；21:30 檢查觸發的處理
 若還在跑，列為「處理中」，完成後字幕照常即寄）
@@ -85,6 +94,13 @@
 5. **議程頁 n=13516 失效** → 到 tcc.gov.tw 導覽選單找「議事日程」的新
    連結，記錄新網址並在日報中註明。
 6. **不確定要不要通知：通知管理者。** 寧可多報。
+7. **`trigger` 回傳 `live_failed` 分類處理**：
+   - `last_failure.reason` 為「YouTube 直播無法後端錄製」→ 已知限制
+     （該場走 YouTube，後端錄不了），**不警報**；等會後官方上架 VOD，由
+     VOD 補抓流程處理即可。
+   - 其他 `live_failed` 原因 → 列入當日日報「待處理/異常」，並視情況通知。
+8. **字幕完成但含未翻譯段落**（`untranslated_batches > 0`）→ 非故障，照
+   結果交付第 4 點寄出並加註即可，不需警報。
 
 ## 邊界（不可逾越）
 
@@ -98,6 +114,7 @@
 ## 附錄：背景知識（僅供異常排查，平時用不到）
 
 - 後端 API：`POST /auto_record_check`（X-Trigger-Secret 驗證）、
+  `GET /auto_status/{vdvno}`（X-Trigger-Secret 驗證，查處理全貌）、
   `GET /check_status/{file_id}?total_chunks=1`、`GET /health`。
 - 議會公開 API base：`https://live.tcc.gov.tw/iSharePortalWeb/api/`
   （SPW002 頻道、SPW003 直播中、SPW024 直播含預告、SPW046 頻道×日期
