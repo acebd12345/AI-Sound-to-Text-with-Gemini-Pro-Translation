@@ -133,7 +133,11 @@ API_TIMEOUT = 60  # 秒，單次 API 呼叫超時時間（Flash 速度快）
 cc = opencc.OpenCC('s2twp')
 
 async def translate_segment_pro(srt_content, index, diarize=False, known_names=""):
-    """使用 Gemini Pro 翻譯單一區塊 (SRT)，含重試與 Key 輪替"""
+    """使用 Gemini Pro 翻譯單一區塊 (SRT)，含重試與 Key 輪替。
+
+    回傳 (text, ok)：ok=True 為翻譯成功；全部重試失敗退回原文時 ok=False。
+    呼叫端據 ok 統計未翻譯批次（翻譯降級不再無聲）。
+    """
 
     # 預處理：在送給 Gemini 之前，先強制用 OpenCC 將所有的簡體字與慣用語轉為台灣繁體
     # 這樣一來，Gemini 收到的文本就已經是繁體了，它的任務單純變成「潤飾」與「除錯」。
@@ -195,7 +199,7 @@ CRITICAL RULES:
                     ),
                     timeout=API_TIMEOUT
                 )
-                return response.text.strip()
+                return response.text.strip(), True
             except asyncio.TimeoutError:
                 print(f"第 {index} 段翻譯超時 ({API_TIMEOUT}s) (嘗試 {attempt + 1})")
                 if attempt < MAX_RETRIES - 1:
@@ -210,7 +214,7 @@ CRITICAL RULES:
                     await asyncio.sleep(delay)
 
         print(f"⚠ 第 {index} 段翻譯全部重試失敗，回傳原文")
-        return preprocessed_srt
+        return preprocessed_srt, False
 
 # --- 上傳接口 (保持不變) ---
 @app.post("/upload_chunk")
@@ -274,7 +278,17 @@ async def check_status(file_id: str, total_chunks: int, background_tasks: Backgr
         srt_content = final_blob.download_as_text()
         plain_blob = bucket.blob(f"final_results/{file_id}_TW_PlainText.txt")
         plain_content = plain_blob.download_as_text() if plain_blob.exists() else ""
-        return {"status": "completed", "srt_text": srt_content, "plain_text": plain_content}
+        resp = {"status": "completed", "srt_text": srt_content, "plain_text": plain_content}
+        # 附上翻譯統計（Complete 最後寫，此時 Meta 必已存在；仍防禦性檢查）
+        meta_blob = bucket.blob(f"final_results/{file_id}_TW_Meta.json")
+        if meta_blob.exists():
+            try:
+                meta = json.loads(meta_blob.download_as_text())
+                resp["total_batches"] = meta.get("total_batches")
+                resp["untranslated_batches"] = meta.get("untranslated_batches")
+            except Exception:
+                pass
+        return resp
     
     # 3. 嘗試取得 Lock（原子性操作，防止競態條件）
     lock_blob = bucket.blob(f"locks/{file_id}")
@@ -411,16 +425,14 @@ async def run_translation_background(file_id, total_chunks, bucket):
                 if w + WAVE_SIZE < len(translation_tasks):
                     await asyncio.sleep(WAVE_DELAY)
             
-            # 4. 組合結果
-            full_translated_text = ""
-            for res in translated_results:
-                full_translated_text += res + "\n\n"
-        else:
-            full_translated_text = ""
-
-        # 存檔 (SRT)
-        final_blob = bucket.blob(f"final_results/{file_id}_TW_Complete.txt")
-        final_blob.upload_from_string(full_translated_text)
+        # 4. 統計與組合結果
+        # translated_results 為 (text, ok) tuple 清單；ok=False 代表該批全部
+        # 重試失敗、退回原文（未翻譯）。
+        total_batches = len(translated_results)
+        untranslated_batches = sum(1 for (_txt, ok) in translated_results if not ok)
+        full_translated_text = ""
+        for text, _ok in translated_results:
+            full_translated_text += text + "\n\n"
 
         # 解析 SRT 產生純文字版本（去除序號與時間戳）
         plain_lines = []
@@ -435,12 +447,22 @@ async def run_translation_background(file_id, total_chunks, bucket):
             if '-->' in stripped:
                 continue
             plain_lines.append(stripped)
-
         plain_text = '\n'.join(plain_lines).strip() + '\n'
-        plain_blob = bucket.blob(f"final_results/{file_id}_TW_PlainText.txt")
-        plain_blob.upload_from_string(plain_text)
 
-        print(f"[{file_id}] 翻譯完成並存檔！")
+        # 5. 存檔——寫入順序硬性規定：PlainText → Meta → Complete。
+        # Complete（_TW_Complete.txt）是 check_status 判定「完成」的旗標，必須
+        # 最後寫；否則 Agent 會在間隙拿到 completed 卻讀不到 Meta。此三步順序
+        # 不可調換。
+        bucket.blob(f"final_results/{file_id}_TW_PlainText.txt").upload_from_string(plain_text)
+        bucket.blob(f"final_results/{file_id}_TW_Meta.json").upload_from_string(
+            json.dumps({
+                "total_batches": total_batches,
+                "untranslated_batches": untranslated_batches,
+            })
+        )
+        bucket.blob(f"final_results/{file_id}_TW_Complete.txt").upload_from_string(full_translated_text)
+
+        print(f"[{file_id}] 翻譯完成並存檔！（批次 {total_batches}，未翻譯 {untranslated_batches}）")
 
     except Exception as e:
         print(f"[{file_id}] 後台翻譯失敗: {e}")
