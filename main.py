@@ -723,6 +723,39 @@ class StartRecordingRequest(BaseModel):
     known_names: str = ""
 
 
+def _check_recording_origin(request: Request) -> None:
+    """錄製端點同源保護：請求須滿足其一，否則 403。
+    1. header X-Trigger-Secret 等於環境變數 AUTO_TRIGGER_SECRET（內部/Agent 用）
+    2. Origin 或 Referer 的 origin 在 ALLOWED_ORIGINS 清單內（前端網頁用）
+
+    ALLOWED_ORIGINS 未設定時維持現狀（不擋，向下相容本地開發）。
+    """
+    if not ALLOWED_ORIGINS:
+        return
+
+    # 條件 1：X-Trigger-Secret
+    secret = os.getenv("AUTO_TRIGGER_SECRET", "")
+    provided = request.headers.get("X-Trigger-Secret", "")
+    if secret and provided and secrets.compare_digest(provided, secret):
+        return
+
+    # 條件 2：Origin / Referer 的 origin 在白名單內
+    from urllib.parse import urlparse
+    for header in ("origin", "referer"):
+        val = request.headers.get(header, "")
+        if not val:
+            continue
+        parsed = urlparse(val)
+        if not parsed.scheme or not parsed.netloc:
+            continue
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        for allowed in ALLOWED_ORIGINS:
+            if secrets.compare_digest(origin, allowed):
+                return
+
+    raise HTTPException(status_code=403, detail="請求來源未授權")
+
+
 @app.post("/find_live_streams")
 async def find_live_streams(req: FindStreamsRequest):
     """搜尋列表頁中正在直播的影片"""
@@ -738,8 +771,9 @@ async def find_live_streams(req: FindStreamsRequest):
 
 
 @app.post("/start_recording")
-async def start_recording(req: StartRecordingRequest, background_tasks: BackgroundTasks):
+async def start_recording(req: StartRecordingRequest, background_tasks: BackgroundTasks, request: Request):
     """開始錄製串流（每 30 分鐘切一段自動處理）"""
+    _check_recording_origin(request)
     stream_url = req.stream_url
 
     # 判斷 URL 類型：如果是影片頁面（非直接串流），先用 yt-dlp 提取
@@ -804,8 +838,9 @@ async def start_recording(req: StartRecordingRequest, background_tasks: Backgrou
 
 
 @app.post("/stop_recording/{session_id}")
-async def stop_recording(session_id: str):
+async def stop_recording(session_id: str, request: Request):
     """停止錄製"""
+    _check_recording_origin(request)
     rec = active_recordings.get(session_id)
     if not rec:
         raise HTTPException(status_code=404, detail="錄製 session 不存在")
