@@ -107,6 +107,11 @@ GEMINI_SEMAPHORE = asyncio.Semaphore(16)
 # 驗證 file_id 防止路徑穿越攻擊
 FILE_ID_PATTERN = re.compile(r'^[\w\-\.]+$')
 
+# 驗證 vdvno（議會影片編號）——比 FILE_ID_PATTERN 收斂：不含底線與點，
+# 因此天然排除 ".." 路徑穿越。所有 vdvno 入口（/auto_status、/start_recording、
+# /auto_record_check 內部）統一用它，hermes-kit 亦自帶同義的一份。
+VDVNO_PATTERN = re.compile(r'^[A-Za-z0-9-]{8,64}$')
+
 def validate_file_id(file_id: str) -> str:
     if not file_id or not FILE_ID_PATTERN.match(file_id):
         raise HTTPException(status_code=400, detail="Invalid file_id: only alphanumeric, underscore, hyphen, and dot are allowed")
@@ -777,6 +782,20 @@ class StartRecordingRequest(BaseModel):
     mode: str = "speech"
     diarize: bool = False
     known_names: str = ""
+    # 選填：帶入時代表這是「自動錄製補救」路徑（外部 Agent 解好 URL 後餵進來），
+    # 會與 /auto_record_check 共用 live marker 防重複。帶入時強制要求
+    # X-Trigger-Secret（見 _require_trigger_secret 的呼叫處）。
+    vdvno: str = ""
+
+
+def _require_trigger_secret(request: Request) -> None:
+    """X-Trigger-Secret 驗證（與 /auto_record_check、/auto_status 同一機制）。"""
+    expected = os.getenv("AUTO_TRIGGER_SECRET", "")
+    if not expected:
+        raise HTTPException(status_code=503, detail="自動錄製功能未啟用（AUTO_TRIGGER_SECRET 未設定）")
+    provided = request.headers.get("X-Trigger-Secret", "")
+    if not secrets.compare_digest(provided, expected):
+        raise HTTPException(status_code=403, detail="X-Trigger-Secret 驗證失敗")
 
 
 def _check_recording_origin(request: Request) -> None:
@@ -828,65 +847,102 @@ async def find_live_streams(req: FindStreamsRequest):
 
 @app.post("/start_recording")
 async def start_recording(req: StartRecordingRequest, background_tasks: BackgroundTasks, request: Request):
-    """開始錄製串流（每 30 分鐘切一段自動處理）"""
+    """開始錄製串流（每 30 分鐘切一段自動處理）
+
+    帶 req.vdvno 時＝「自動錄製補救」路徑：額外強制 X-Trigger-Secret，並與
+    /auto_record_check 共用 live marker 防重複（搶不到回 409）。不帶 vdvno 時
+    行為與過去完全相同（僅同源保護、不碰任何 marker）。
+    """
     _check_recording_origin(request)
-    stream_url = req.stream_url
 
-    # 判斷 URL 類型：如果是影片頁面（非直接串流），先用 yt-dlp 提取
-    # get_stream_url 失敗會 raise StreamExtractError，這裡轉回 HTTPException(400)，
-    # 對外行為與重構前一致（原本就是回 400）。
-    is_direct_stream = any(stream_url.lower().endswith(ext) for ext in ['.m3u8', '.mp4', '.flv', '.ts'])
-    if not is_direct_stream:
-        # 影片頁面（VideoData.aspx）或其他非直接串流皆走 get_stream_url 提取
-        validate_stream_url(stream_url)
-        try:
-            stream_url = await get_stream_url(stream_url)
-        except StreamExtractError as e:
-            raise HTTPException(status_code=400, detail=e.detail)
+    vdvno = (req.vdvno or "").strip()
+    bucket = None
+    claimed_vdvno = None  # 已搶到 marker 的 vdvno；中途失敗須釋放
+    if vdvno:
+        # 帶 vdvno 者必須是內部/Agent 呼叫：只有同源（前端網頁）不足以
+        # 搶佔 live marker 干擾自動錄製。
+        _require_trigger_secret(request)
+        if not VDVNO_PATTERN.match(vdvno):
+            raise HTTPException(status_code=400, detail="Invalid vdvno")
+        bucket = storage_client.bucket(BUCKET_NAME)
+        if not claim_live_with_stale_recovery(bucket, vdvno, req.title or "議會直播補救"):
+            raise HTTPException(status_code=409, detail="此場次已有錄製進行中或剛被其他請求接手")
+        claimed_vdvno = vdvno
 
-    # 入口防護：VOD（錄影檔）網址不可進入直播錄製迴圈
-    if is_vod_url(stream_url):
-        raise HTTPException(status_code=400, detail=VOD_REJECT_DETAIL)
+    # 已搶到 marker 後，session 建立前的任何失敗都必須先釋放 marker 再往外拋，
+    # 否則該場次會被死 marker 卡住直到陳舊回收（最久 1 小時）。
+    try:
+        stream_url = req.stream_url
 
-    # 驗證 ffmpeg 能否連上串流
-    probe_proc = await asyncio.create_subprocess_exec(
-        "ffmpeg",
-        "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "-headers", f"Referer: {stream_url}\r\n",
-        "-i", stream_url, "-t", "2", "-f", "null", "-",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-    _, probe_stderr = await asyncio.wait_for(probe_proc.communicate(), timeout=20)
-    probe_output = probe_stderr.decode(errors='replace')
-    print(f"[串流探測] ffmpeg probe 輸出 (末 300 字): {probe_output[-300:]}")
-    if "Server returned" in probe_output and "404" in probe_output:
-        raise HTTPException(status_code=400, detail="串流 URL 無效 (404)")
-    if "Connection refused" in probe_output:
-        raise HTTPException(status_code=400, detail="無法連線到串流伺服器")
-    if "Invalid data found" in probe_output and "Output" not in probe_output:
-        raise HTTPException(status_code=400, detail=f"串流格式無法辨識: {probe_output[-200:]}")
+        # 判斷 URL 類型：如果是影片頁面（非直接串流），先用 yt-dlp 提取
+        # get_stream_url 失敗會 raise StreamExtractError，這裡轉回 HTTPException(400)，
+        # 對外行為與重構前一致（原本就是回 400）。
+        is_direct_stream = any(stream_url.lower().endswith(ext) for ext in ['.m3u8', '.mp4', '.flv', '.ts'])
+        if not is_direct_stream:
+            # 影片頁面（VideoData.aspx）或其他非直接串流皆走 get_stream_url 提取
+            validate_stream_url(stream_url)
+            try:
+                stream_url = await get_stream_url(stream_url)
+            except StreamExtractError as e:
+                raise HTTPException(status_code=400, detail=e.detail)
 
-    suffix = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=6))
-    session_id = f"rec_{int(time.time())}_{suffix}"
+        # 入口防護：VOD（錄影檔）網址不可進入直播錄製迴圈
+        if is_vod_url(stream_url):
+            raise HTTPException(status_code=400, detail=VOD_REJECT_DETAIL)
 
-    active_recordings[session_id] = {
-        "status": "recording",
-        "stream_url": stream_url,
-        "title": req.title or "直播錄製",
-        "mode": req.mode,
-        "diarize": req.diarize,
-        "known_names": req.known_names,
-        "segments": [],
-        "stop": False,
-        "started_at": time.time(),
-        "error": None,
-    }
+        # 驗證 ffmpeg 能否連上串流
+        probe_proc = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "-headers", f"Referer: {stream_url}\r\n",
+            "-i", stream_url, "-t", "2", "-f", "null", "-",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        _, probe_stderr = await asyncio.wait_for(probe_proc.communicate(), timeout=20)
+        probe_output = probe_stderr.decode(errors='replace')
+        print(f"[串流探測] ffmpeg probe 輸出 (末 300 字): {probe_output[-300:]}")
+        if "Server returned" in probe_output and "404" in probe_output:
+            raise HTTPException(status_code=400, detail="串流 URL 無效 (404)")
+        if "Connection refused" in probe_output:
+            raise HTTPException(status_code=400, detail="無法連線到串流伺服器")
+        if "Invalid data found" in probe_output and "Output" not in probe_output:
+            raise HTTPException(status_code=400, detail=f"串流格式無法辨識: {probe_output[-200:]}")
+
+        suffix = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=6))
+        session_id = f"rec_{int(time.time())}_{suffix}"
+
+        rec = {
+            "status": "recording",
+            "stream_url": stream_url,
+            "title": req.title or "直播錄製",
+            "mode": req.mode,
+            "diarize": req.diarize,
+            "known_names": req.known_names,
+            "segments": [],
+            "stop": False,
+            "started_at": time.time(),
+            "error": None,
+        }
+        if claimed_vdvno:
+            # 交給 recording_loop 既有的 finally：條件釋放 marker ＋ 落地 live_failure
+            rec["auto_vdvno"] = claimed_vdvno
+        active_recordings[session_id] = rec
+    except Exception:
+        if claimed_vdvno:
+            release_auto_state(bucket, "live", claimed_vdvno)
+        raise
 
     background_tasks.add_task(
         recording_loop, session_id, stream_url,
         req.mode, req.diarize, req.known_names
     )
+
+    if claimed_vdvno:
+        # 與 /auto_record_check 開錄成功後的處理一致
+        update_auto_state(bucket, "live", claimed_vdvno, session_id=session_id, status="recording")
+        _clear_live_failure(bucket, claimed_vdvno)
+        print(f"[rescue] 直播補救開錄 {claimed_vdvno} → {session_id}")
 
     return {
         "status": "recording_started",
@@ -1292,6 +1348,26 @@ def _is_stale_live_marker(bucket, marker: dict) -> bool:
     return (time.time() - marker.get("started_at", 0)) > 3600
 
 
+def claim_live_with_stale_recovery(bucket, vdvno: str, title: str = "") -> bool:
+    """搶 live marker；搶不到時檢查是否為陳舊 marker（⑤：防實例重啟後半場沒人錄），
+    是則以讀 marker 時的 generation 條件刪除後 re-claim。
+
+    /auto_record_check 的直播掃描與 /start_recording 的補救路徑共用此函式，
+    確保兩條入口的防重複與回收語意完全一致。搶到回 True，否則 False。
+    """
+    if claim_auto_state(bucket, "live", vdvno, title):
+        return True
+
+    marker, gen = _read_marker(bucket, "live", vdvno)
+    if _is_stale_live_marker(bucket, marker) and gen is not None:
+        # 條件刪除失敗（generation 不符＝別人剛動過）→ 不 re-claim，讓對方去錄。
+        if _conditional_delete_marker(bucket, "live", vdvno, gen):
+            print(f"[marker回收] live {vdvno} 回收陳舊 marker，重新開錄")
+            return claim_auto_state(bucket, "live", vdvno, title)
+        print(f"[marker回收] live {vdvno} 條件刪除失敗（generation 不符），本輪跳過")
+    return False
+
+
 # --- 自動錄製：VOD 下載函式（核心新功能） ---
 VOD_DOWNLOAD_TIMEOUT = 3600  # 整體下載+切段的 timeout（秒）
 
@@ -1523,12 +1599,7 @@ def _now_taiwan_str() -> str:
 async def auto_record_check(request: Request, background_tasks: BackgroundTasks):
     """自動觸發端點（排程器/Hermes 入口）：掃直播開錄、掃 VOD 補抓。"""
     # 1. 驗證
-    expected = os.getenv("AUTO_TRIGGER_SECRET", "")
-    if not expected:
-        raise HTTPException(status_code=503, detail="自動錄製功能未啟用（AUTO_TRIGGER_SECRET 未設定）")
-    provided = request.headers.get("X-Trigger-Secret", "")
-    if not secrets.compare_digest(provided, expected):
-        raise HTTPException(status_code=403, detail="X-Trigger-Secret 驗證失敗")
+    _require_trigger_secret(request)
 
     # 自動觸發預設參數（環境變數控制）
     auto_mode = os.getenv("AUTO_RECORD_MODE", "speech")
@@ -1564,30 +1635,19 @@ async def auto_record_check(request: Request, background_tasks: BackgroundTasks)
 
     for item in live_items:
         vdvno = item.get("vdv_vdvno", "") or item.get("VideoNo", "")
-        if not vdvno:
+        if not vdvno or not VDVNO_PATTERN.match(vdvno):
             skipped += 1
             continue
         title = item.get("vdv_title", "") or item.get("vdt_title", "") or "直播錄製"
 
-        # 搶鎖；搶不到時檢查是否為陳舊 marker（⑤：防實例重啟後半場沒人錄）
-        claimed = claim_auto_state(bucket, "live", vdvno, title)
-        if not claimed:
-            marker, gen = _read_marker(bucket, "live", vdvno)
-            if _is_stale_live_marker(bucket, marker) and gen is not None:
-                # 用讀 marker 時的 generation 做條件刪除，刪成功才 re-claim；
-                # 失敗（generation 不符＝別人剛動過）本輪跳過該場。
-                if _conditional_delete_marker(bucket, "live", vdvno, gen):
-                    print(f"[marker回收] live {vdvno} 回收陳舊 marker，重新開錄")
-                    claimed = claim_auto_state(bucket, "live", vdvno, title)
-                else:
-                    print(f"[marker回收] live {vdvno} 條件刪除失敗（generation 不符），本輪跳過")
-            if not claimed:
-                # 仍在處理中或回收失敗：既有失敗記錄且仍在直播清單 → 附上供回報
-                existing_lf = _read_live_failure(bucket, vdvno)
-                if existing_lf:
-                    live_failed.append({"vdvno": vdvno, "title": title, "last_failure": existing_lf})
-                skipped += 1
-                continue
+        # 搶鎖（含陳舊 marker 回收）；與 /start_recording 補救路徑共用同一函式
+        if not claim_live_with_stale_recovery(bucket, vdvno, title):
+            # 仍在處理中或回收失敗：既有失敗記錄且仍在直播清單 → 附上供回報
+            existing_lf = _read_live_failure(bucket, vdvno)
+            if existing_lf:
+                live_failed.append({"vdvno": vdvno, "title": title, "last_failure": existing_lf})
+            skipped += 1
+            continue
 
         # 開錄：走既有 get_stream_url + recording_loop
         session_id = None
@@ -1661,7 +1721,7 @@ async def auto_record_check(request: Request, background_tasks: BackgroundTasks)
                     continue
                 for vod in vod_list:
                     vdvno = vod.get("vdv_vdvno", "")
-                    if not vdvno:
+                    if not vdvno or not VDVNO_PATTERN.match(vdvno):
                         continue
                     title = vod.get("vdv_title", "") or ""
                     if not claim_auto_state(bucket, "vod", vdvno, title):
@@ -1712,15 +1772,10 @@ def _read_auto_json_or_502(bucket, path: str):
 async def auto_status(vdvno: str, request: Request):
     """讓 Agent 查得到某 vdvno 的處理全貌（marker / session / 失敗記錄）。"""
     # 驗證：與 /auto_record_check 相同的 X-Trigger-Secret 機制
-    expected = os.getenv("AUTO_TRIGGER_SECRET", "")
-    if not expected:
-        raise HTTPException(status_code=503, detail="自動錄製功能未啟用（AUTO_TRIGGER_SECRET 未設定）")
-    provided = request.headers.get("X-Trigger-Secret", "")
-    if not secrets.compare_digest(provided, expected):
-        raise HTTPException(status_code=403, detail="X-Trigger-Secret 驗證失敗")
+    _require_trigger_secret(request)
 
-    # vdvno 字元檢查（與 validate_file_id 同級，防路徑注入）
-    if not vdvno or not FILE_ID_PATTERN.match(vdvno) or ".." in vdvno:
+    # vdvno 字元檢查（統一用 VDVNO_PATTERN：不含 . 與 _，天然排除路徑穿越）
+    if not vdvno or not VDVNO_PATTERN.match(vdvno):
         raise HTTPException(status_code=400, detail="Invalid vdvno")
 
     bucket = storage_client.bucket(BUCKET_NAME)
