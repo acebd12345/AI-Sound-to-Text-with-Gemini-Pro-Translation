@@ -13,6 +13,8 @@ import json
 import os
 import sys
 import types
+import urllib.error
+from datetime import datetime, timedelta
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -605,6 +607,412 @@ async def test_recording_status_file_ids():
         check("查無 session → 404", e.status_code == 404)
 
 
+# ============ ② kit rescue（council_ops） ============
+# council_ops.py 在 hermes-kit/ 下，import 時會讀該目錄的 .env（唯讀，不改動）。
+sys.path.insert(0, str(REPO / "hermes-kit"))
+import council_ops as ops  # noqa: E402
+
+YT_URL = "https://www.youtube.com/watch?v=abc123"
+
+
+class _Args:
+    """模擬 argparse 的 namespace。"""
+
+    def __init__(self, **kw):
+        self.vdvno = VDVNO
+        self.url = None
+        self.title = None
+        self.follow = False
+        self.until = "19:00"
+        self.interval = 600
+        self.__dict__.update(kw)
+
+
+class _FakeCompleted:
+    def __init__(self, stdout=b"", stderr=b"", returncode=0):
+        self.stdout, self.stderr, self.returncode = stdout, stderr, returncode
+
+
+def _patch(obj, name, value):
+    """回傳 (還原用 callable)，讓測試結束後復原。"""
+    orig = getattr(obj, name)
+    setattr(obj, name, value)
+    return lambda: setattr(obj, name, orig)
+
+
+def _run_rescue_once(args, ytdlp_stdout, backend_impl, ytdlp_path="/usr/bin/yt-dlp",
+                     portal_impl=None):
+    """在全 mock 環境下跑 _rescue_once，回傳 (result, 送出的 subprocess cmd)。"""
+    import subprocess
+    seen = {}
+
+    def _fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        seen["timeout"] = kw.get("timeout")
+        return _FakeCompleted(stdout=ytdlp_stdout)
+
+    def _fake_portal(endpoint, params=None):
+        seen["portal"] = (endpoint, params)
+        if portal_impl:
+            return portal_impl(endpoint, params)
+        return [{"vdv_url": YT_URL, "vdv_title": "台北市議會大會"}]
+
+    undo = [
+        _patch(subprocess, "run", _fake_run),
+        _patch(ops, "portal", _fake_portal),
+        _patch(ops, "_find_ytdlp", lambda: ytdlp_path),
+        _patch(ops, "backend", backend_impl),
+    ]
+    try:
+        return ops._rescue_once(args), seen
+    finally:
+        for fn in undo:
+            fn()
+
+
+def test_rescue_happy_path():
+    section("② rescue 正常解出並開錄")
+    sent = {}
+
+    def _backend(path, method="GET", with_secret=False, timeout=60, json_body=None):
+        sent.update(path=path, method=method, with_secret=with_secret, body=json_body)
+        return {"status": "recording_started", "session_id": "rec_999_abcdef"}
+
+    # 多行 stdout（yt-dlp 影音分離時常見）：要挑到 HLS 那行，不是第一行
+    stdout = (b"https://rr1---sn-x.googlevideo.com/videoplayback?expire=1784200000&other=1\n"
+              b"https://rr1---sn-x.googlevideo.com/api/manifest/hls_playlist/expire/1784207000/x/index.m3u8\n")
+    r, seen = _run_rescue_once(_Args(), stdout, _backend)
+
+    check("回傳 recording_started", r["status"] == "recording_started")
+    check("帶回 session_id", r["session_id"] == "rec_999_abcdef")
+    check("帶回 vdvno", r["vdvno"] == VDVNO)
+    check("title 取自 vdv_title", r["title"] == "台北市議會大會")
+    check("打 SPW010 取 vdv_url", seen["portal"] == ("SPW010_VideoData", {"vdv_vdvno": VDVNO}))
+    check("yt-dlp 命令為 -g --no-warnings 且不帶 -f",
+          seen["cmd"] == ["/usr/bin/yt-dlp", "-g", "--no-warnings", YT_URL])
+    check("yt-dlp timeout 60s", seen["timeout"] == 60)
+    check("挑到 HLS 那行（非第一行）", "hls_playlist" in sent["body"]["stream_url"])
+    check("POST /start_recording", sent["path"] == "/start_recording" and sent["method"] == "POST")
+    check("帶 secret", sent["with_secret"] is True)
+    check("body 含 vdvno/mode/title",
+          sent["body"]["vdvno"] == VDVNO and sent["body"]["mode"] == "speech"
+          and sent["body"]["title"] == "台北市議會大會")
+
+    # --title 優先於 vdv_title
+    r2, _ = _run_rescue_once(_Args(title="自訂標題"), stdout, _backend)
+    check("--title 優先於 vdv_title", r2["title"] == "自訂標題")
+
+    # 沒有 HLS 特徵時退回第一個 https 行
+    r3, _ = _run_rescue_once(_Args(), b"https://example.com/stream/xyz\n", _backend)
+    check("無 HLS 特徵 → 退回第一個 https 行",
+          sent["body"]["stream_url"] == "https://example.com/stream/xyz")
+
+
+def test_rescue_expire_parsing():
+    section("② manifest 到期時間解析（兩種形式）")
+    from datetime import datetime as _dt
+    epoch = 1784207000
+    expected = _dt.fromtimestamp(epoch, ops.TW_TZ).strftime("%Y/%m/%d %H:%M:%S")
+
+    path_form = f"https://x.googlevideo.com/api/manifest/hls_playlist/expire/{epoch}/x/index.m3u8"
+    qs_form = f"https://x.googlevideo.com/videoplayback?id=1&expire={epoch}&sig=2"
+    check("解析 /expire/<epoch>/ 形式", ops._manifest_expires_taiwan(path_form) == expected)
+    check("解析 ?expire=<epoch> 形式", ops._manifest_expires_taiwan(qs_form) == expected)
+    check("格式為 YYYY/MM/DD HH:MM:SS",
+          bool(__import__("re").match(r"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}$", expected)))
+    check("無 expire → None",
+          ops._manifest_expires_taiwan("https://x.googlevideo.com/x.m3u8") is None)
+    check("expire 非數字/畸形 → None",
+          ops._manifest_expires_taiwan("https://x/?expire=abc") is None)
+
+    # 端到端：rescue 輸出帶 manifest_expires_taiwan
+    def _backend(path, method="GET", with_secret=False, timeout=60, json_body=None):
+        return {"session_id": "rec_1"}
+    r, _ = _run_rescue_once(_Args(), (path_form + "\n").encode(), _backend)
+    check("rescue 輸出含 manifest_expires_taiwan", r["manifest_expires_taiwan"] == expected)
+
+
+def test_rescue_rejects_non_youtube():
+    section("② 非 YouTube hostname 一律拒絕")
+    check("接受 youtube.com", ops._is_youtube_url("https://youtube.com/watch?v=1"))
+    check("接受 www.youtube.com", ops._is_youtube_url("https://www.youtube.com/watch?v=1"))
+    check("接受 m.youtube.com", ops._is_youtube_url("https://m.youtube.com/watch?v=1"))
+    check("接受 youtu.be", ops._is_youtube_url("https://youtu.be/abc"))
+    check("拒絕 evil.com（路徑含 youtube.com 也不行）",
+          not ops._is_youtube_url("https://evil.com/youtube.com/x"))
+    check("拒絕 notyoutube.com", not ops._is_youtube_url("https://notyoutube.com/x"))
+    check("拒絕 youtube.com.evil.com", not ops._is_youtube_url("https://youtube.com.evil.com/x"))
+    check("拒絕議會 HLS（rescue 不是萬用下載器）",
+          not ops._is_youtube_url("https://tccstr2.tcc.gov.tw/live/x.m3u8"))
+
+    def _backend(*a, **k):
+        raise AssertionError("不該打到後端")
+
+    # (a) vdv_url 非 YouTube → die（SystemExit）
+    try:
+        _run_rescue_once(_Args(), b"", _backend,
+                         portal_impl=lambda e, p: [{"vdv_url": "https://tccstr2.tcc.gov.tw/live/x.m3u8",
+                                                    "vdv_title": "一般場次"}])
+        check("vdv_url 非 YouTube → 報錯", False)
+    except SystemExit as e:
+        check("vdv_url 非 YouTube → 報錯", e.code == 1)
+
+    # (b) --url 非 YouTube → 同樣拒絕
+    try:
+        _run_rescue_once(_Args(url="https://vimeo.com/123"), b"", _backend)
+        check("--url 非 YouTube → 報錯", False)
+    except SystemExit as e:
+        check("--url 非 YouTube → 報錯", e.code == 1)
+
+    # (c) vdvno 格式不符 → 報錯
+    try:
+        _run_rescue_once(_Args(vdvno="bad_vdvno"), b"", _backend)
+        check("vdvno 格式不符 → 報錯", False)
+    except SystemExit as e:
+        check("vdvno 格式不符 → 報錯", e.code == 1)
+
+
+def test_rescue_ytdlp_missing():
+    section("② yt-dlp 缺失報錯")
+    import shutil
+    undo = [_patch(shutil, "which", lambda n: None),
+            _patch(ops.Path, "home", staticmethod(lambda: Path("/nonexistent-home")))]
+    try:
+        ops._find_ytdlp()
+        check("找不到 yt-dlp → 報錯", False)
+    except SystemExit as e:
+        check("找不到 yt-dlp → 報錯", e.code == 1)
+    finally:
+        for fn in undo:
+            fn()
+
+
+def test_rescue_409_is_success():
+    section("② 後端 409 → already_recording 且 exit 0")
+
+    def _backend_409(path, method="GET", with_secret=False, timeout=60, json_body=None):
+        raise urllib.error.HTTPError(path, 409, "Conflict", {}, None)
+
+    stdout = b"https://x.googlevideo.com/api/manifest/hls_playlist/expire/1784207000/x/index.m3u8\n"
+    r, _ = _run_rescue_once(_Args(), stdout, _backend_409)
+    check("409 → already_recording", r["status"] == "already_recording")
+    check("409 → 帶 vdvno", r["vdvno"] == VDVNO)
+
+    # cmd_rescue 不得 exit 非 0（冪等：重複補救不是錯誤）
+    import subprocess
+    undo = [
+        _patch(subprocess, "run", lambda cmd, **kw: _FakeCompleted(stdout=stdout)),
+        _patch(ops, "portal", lambda e, p=None: [{"vdv_url": YT_URL, "vdv_title": "大會"}]),
+        _patch(ops, "_find_ytdlp", lambda: "/usr/bin/yt-dlp"),
+        _patch(ops, "backend", _backend_409),
+    ]
+    try:
+        ops.cmd_rescue(_Args())
+        check("cmd_rescue 遇 409 不 exit（=exit 0）", True)
+    except SystemExit:
+        check("cmd_rescue 遇 409 不 exit（=exit 0）", False)
+    finally:
+        for fn in undo:
+            fn()
+
+    # 其他 HTTP 錯誤仍要往外拋（不可吞掉）
+    def _backend_500(path, method="GET", with_secret=False, timeout=60, json_body=None):
+        raise urllib.error.HTTPError(path, 500, "Server Error", {}, None)
+    try:
+        _run_rescue_once(_Args(), stdout, _backend_500)
+        check("500 仍往外拋", False)
+    except urllib.error.HTTPError as e:
+        check("500 仍往外拋", e.code == 500)
+
+
+def test_http_json_body_encoding():
+    section("② http_json 的 json_body 編碼與 Content-Type")
+    captured = {}
+
+    class _Resp:
+        def read(self):
+            return b'{"ok": true}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _fake_urlopen(req, timeout=None, context=None):
+        captured["req"] = req
+        return _Resp()
+
+    undo = [_patch(ops.urllib.request, "urlopen", _fake_urlopen),
+            _patch(ops, "_ssl_context", lambda: None)]
+    try:
+        r = ops.http_json("https://x/api", method="POST",
+                          headers={"X-Trigger-Secret": "s"},
+                          json_body={"title": "大會直播", "vdvno": VDVNO})
+        req = captured["req"]
+        check("回傳解析後 JSON", r == {"ok": True})
+        check("method 為 POST", req.get_method() == "POST")
+        check("body 為 UTF-8 JSON",
+              json.loads(req.data.decode("utf-8")) == {"title": "大會直播", "vdvno": VDVNO})
+        check("中文以 UTF-8 位元組送出（非 \\u 逃脫）", "大會直播".encode("utf-8") in req.data)
+        check("自動帶 Content-Type: application/json",
+              req.get_header("Content-type") == "application/json")
+        check("既有 header 保留", req.get_header("X-trigger-secret") == "s")
+
+        # 不帶 json_body → 行為與過去相同（無 body、無 Content-Type）
+        ops.http_json("https://x/api", headers={"A": "b"})
+        req2 = captured["req"]
+        check("不帶 json_body → 無 body", req2.data is None)
+        check("不帶 json_body → 無 Content-Type", req2.get_header("Content-type") is None)
+    finally:
+        for fn in undo:
+            fn()
+
+
+# ============ ② --follow 監控迴圈（可注入 clock / backend） ============
+
+class _FakeClock:
+    """假時鐘：sleep 直接推進時間，不真的等待。"""
+
+    def __init__(self, start):
+        self.now = start
+        self.slept = []
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+        self.now += timedelta(seconds=seconds)
+
+
+def _follow(args, clock, rescue_results, status_script):
+    """跑 _rescue_follow，rescue_results / status_script 為依序回傳的腳本。"""
+    calls = {"rescue": 0, "status": 0}
+
+    def _rescue(_a):
+        r = rescue_results[min(calls["rescue"], len(rescue_results) - 1)]
+        calls["rescue"] += 1
+        return r
+
+    def _status(_sid):
+        r = status_script[min(calls["status"], len(status_script) - 1)]
+        calls["status"] += 1
+        return r
+
+    out = ops._rescue_follow(args, deps={
+        "now": clock, "sleep": clock.sleep,
+        "rescue_once": _rescue, "recording_status": _status,
+    })
+    return out, calls
+
+
+def test_follow_normal_stop():
+    section("② --follow 正常 stopped 收尾")
+    clock = _FakeClock(datetime(2026, 7, 16, 14, 0, tzinfo=ops.TW_TZ))
+    out, calls = _follow(
+        _Args(follow=True, until="19:00", interval=600),
+        clock,
+        [{"status": "recording_started", "session_id": "rec_A"}],
+        [
+            {"status": "recording", "file_ids": ["rec_A_seg0"]},
+            {"status": "recording", "file_ids": ["rec_A_seg0", "rec_A_seg1"]},
+            {"status": "stopped", "file_ids": ["rec_A_seg0", "rec_A_seg1"], "error": None},
+        ],
+    )
+    check("正常結束 → stop_reason=stopped", out["stop_reason"] == "stopped")
+    check("彙整所有 file_ids", out["file_ids"] == ["rec_A_seg0", "rec_A_seg1"])
+    check("無重啟", out["restarts"] == 0)
+    check("正常結束即收手，不再輪詢", calls["status"] == 3)
+    check("未到 until 就結束（省時）", clock.now.hour < 19)
+
+
+def test_follow_restarts_on_error():
+    section("② --follow 中斷後自動重新 rescue")
+    clock = _FakeClock(datetime(2026, 7, 16, 14, 0, tzinfo=ops.TW_TZ))
+    out, calls = _follow(
+        _Args(follow=True, until="19:00", interval=600),
+        clock,
+        [{"status": "recording_started", "session_id": "rec_A"},
+         {"status": "recording_started", "session_id": "rec_B"}],
+        [
+            {"status": "recording", "file_ids": ["rec_A_seg0"]},
+            # 斷線（manifest 到期）→ 應重新 rescue 拿到 rec_B
+            {"status": "stopped", "file_ids": ["rec_A_seg0"], "error": "串流已結束或錄製失敗"},
+            {"status": "recording", "file_ids": ["rec_B_seg0"]},
+            {"status": "stopped", "file_ids": ["rec_B_seg0"], "error": None},
+        ],
+    )
+    check("中斷後重新 rescue（restarts=1）", out["restarts"] == 1)
+    check("收尾時 session 為新的 rec_B", out["session_id"] == "rec_B"),
+    check("新舊 session 的 file_ids 都收齊",
+          out["file_ids"] == ["rec_A_seg0", "rec_B_seg0"])
+    check("最終正常收尾", out["stop_reason"] == "stopped")
+    check("rescue 共呼叫 2 次（首次＋重錄）", calls["rescue"] == 2)
+
+
+def test_follow_until_reached():
+    section("② --follow 到 --until 收尾")
+    clock = _FakeClock(datetime(2026, 7, 16, 18, 30, tzinfo=ops.TW_TZ))
+    out, _ = _follow(
+        _Args(follow=True, until="19:00", interval=600),  # 30 分鐘 → 3 輪
+        clock,
+        [{"status": "recording_started", "session_id": "rec_A"}],
+        [{"status": "recording", "file_ids": ["rec_A_seg0"]}],
+    )
+    check("到 until → stop_reason=until_reached", out["stop_reason"] == "until_reached")
+    check("到 until 即停止（不超過 19:00 太多）", clock.now.hour == 19 and clock.now.minute == 0)
+    check("仍回報已觀察到的 file_ids", out["file_ids"] == ["rec_A_seg0"])
+    check("總結含 until_taiwan", out["until_taiwan"] == "2026/07/16 19:00")
+
+    # until 已過 → 單次 rescue 後立即收尾
+    clock2 = _FakeClock(datetime(2026, 7, 16, 19, 30, tzinfo=ops.TW_TZ))
+    out2, calls2 = _follow(
+        _Args(follow=True, until="19:00", interval=600), clock2,
+        [{"status": "recording_started", "session_id": "rec_A"}],
+        [{"status": "recording", "file_ids": []}],
+    )
+    check("until 已過 → 不進入監控迴圈", calls2["status"] == 0)
+    check("until 已過 → 仍有做一次 rescue", calls2["rescue"] == 1)
+
+
+def test_follow_409_then_takeover():
+    section("② --follow 首次 409（已在錄）→ 續監控直到接手")
+    clock = _FakeClock(datetime(2026, 7, 16, 14, 0, tzinfo=ops.TW_TZ))
+    out, calls = _follow(
+        _Args(follow=True, until="15:00", interval=600),
+        clock,
+        # 首次 409 → 無 session_id；下一輪 rescue 拿到 session
+        [{"status": "already_recording", "vdvno": VDVNO},
+         {"status": "recording_started", "session_id": "rec_C"}],
+        [{"status": "stopped", "file_ids": ["rec_C_seg0"], "error": None}],
+    )
+    check("409 不中止，續監控並接手", out["session_id"] == "rec_C")
+    check("接手計入 restarts", out["restarts"] == 1)
+    check("接手後正常收尾", out["stop_reason"] == "stopped")
+    check("收齊 file_ids", out["file_ids"] == ["rec_C_seg0"])
+
+
+def test_follow_status_error_tolerated():
+    section("② --follow 查詢失敗不中斷監控")
+    clock = _FakeClock(datetime(2026, 7, 16, 14, 0, tzinfo=ops.TW_TZ))
+    calls = {"n": 0}
+
+    def _status(_sid):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("後端 502")
+        return {"status": "stopped", "file_ids": ["rec_A_seg0"], "error": None}
+
+    out = ops._rescue_follow(_Args(follow=True, until="19:00", interval=600), deps={
+        "now": clock, "sleep": clock.sleep,
+        "rescue_once": lambda a: {"status": "recording_started", "session_id": "rec_A"},
+        "recording_status": _status,
+    })
+    check("查詢失敗後續輪仍繼續", calls["n"] == 2)
+    check("最終正常收尾", out["stop_reason"] == "stopped")
+
+
 async def main_async():
     test_vdvno_pattern()
     await test_auto_status_uses_vdvno_pattern()
@@ -619,6 +1027,17 @@ async def main_async():
     await test_auto_record_check_skips_bad_vdvno()
     await test_session_state_file_ids()
     await test_recording_status_file_ids()
+    test_rescue_happy_path()
+    test_rescue_expire_parsing()
+    test_rescue_rejects_non_youtube()
+    test_rescue_ytdlp_missing()
+    test_rescue_409_is_success()
+    test_http_json_body_encoding()
+    test_follow_normal_stop()
+    test_follow_restarts_on_error()
+    test_follow_until_reached()
+    test_follow_409_then_takeover()
+    test_follow_status_error_tolerated()
 
 
 if __name__ == "__main__":
