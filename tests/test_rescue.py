@@ -532,6 +532,79 @@ async def test_auto_record_check_skips_bad_vdvno():
         main._ishare_get = orig_ishare
 
 
+# ============ ②' session 落地與 /recording_status 補 file_ids ============
+
+async def test_session_state_file_ids():
+    section("②' _write_session_state 落地 file_ids")
+    _reset()
+    rec = {
+        "status": "recording",
+        "title": "大會",
+        "segments": [
+            {"file_id": "rec_1_seg0", "total_chunks": 1, "segment_num": 0, "status": "uploaded"},
+            {"file_id": "rec_1_seg1", "total_chunks": 1, "segment_num": 1, "status": "uploaded"},
+        ],
+        "error": None,
+    }
+    main._write_session_state(BUCKET, "rec_1", rec)
+    landed = json.loads(BUCKET.blobs["auto_state/sessions/rec_1"][0])
+    check("落地含 file_ids", landed.get("file_ids") == ["rec_1_seg0", "rec_1_seg1"])
+    check("仍保留段數欄位（不破壞既有格式）", landed.get("segments") == 2)
+    check("仍保留 status/title/error",
+          landed.get("status") == "recording" and landed.get("title") == "大會"
+          and "error" in landed and "updated_at" in landed)
+
+    # 尚未有任何段落 → 空清單而非缺欄位
+    main._write_session_state(BUCKET, "rec_empty", {"status": "recording", "segments": []})
+    check("無段落時 file_ids 為空清單",
+          json.loads(BUCKET.blobs["auto_state/sessions/rec_empty"][0]).get("file_ids") == [])
+
+
+async def test_recording_status_file_ids():
+    section("②' /recording_status 兩種來源都回 file_ids")
+
+    # (a) 記憶體來源
+    _reset()
+    main.active_recordings["rec_mem"] = {
+        "status": "recording",
+        "title": "大會",
+        "started_at": main.time.time(),
+        "segments": [
+            {"file_id": "rec_mem_seg0", "total_chunks": 1, "segment_num": 0, "status": "uploaded"},
+        ],
+        "error": None,
+    }
+    r = await main.recording_status("rec_mem")
+    check("記憶體來源回 file_ids", r.get("file_ids") == ["rec_mem_seg0"])
+    check("記憶體來源仍保留 segments 明細", len(r.get("segments", [])) == 1)
+
+    # (b) GCS 落地來源（實例重啟情境）
+    _reset()
+    BUCKET.blob("auto_state/sessions/rec_gcs").upload_from_string(json.dumps({
+        "status": "stopped", "title": "大會", "segments": 2,
+        "file_ids": ["rec_gcs_seg0", "rec_gcs_seg1"], "error": None,
+    }))
+    r = await main.recording_status("rec_gcs")
+    check("GCS 來源回 file_ids", r.get("file_ids") == ["rec_gcs_seg0", "rec_gcs_seg1"])
+    check("GCS 來源標記 note", "restarted" in r.get("note", ""))
+
+    # (c) 舊格式落地（無 file_ids 欄位）→ 補空清單，欄位恆存在
+    _reset()
+    BUCKET.blob("auto_state/sessions/rec_old").upload_from_string(json.dumps({
+        "status": "stopped", "title": "舊格式", "segments": 1, "error": None,
+    }))
+    r = await main.recording_status("rec_old")
+    check("舊格式落地補上空 file_ids", r.get("file_ids") == [])
+
+    # (d) 查無 session → 仍 404
+    _reset()
+    try:
+        await main.recording_status("rec_missing")
+        check("查無 session → 404", False)
+    except HTTPException as e:
+        check("查無 session → 404", e.status_code == 404)
+
+
 async def main_async():
     test_vdvno_pattern()
     await test_auto_status_uses_vdvno_pattern()
@@ -544,6 +617,8 @@ async def main_async():
     await test_start_recording_recovers_stale_marker()
     await test_auto_record_check_stale_recovery_regression()
     await test_auto_record_check_skips_bad_vdvno()
+    await test_session_state_file_ids()
+    await test_recording_status_file_ids()
 
 
 if __name__ == "__main__":

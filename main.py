@@ -985,6 +985,8 @@ async def recording_status(session_id: str):
             blob = bucket.blob(f"auto_state/sessions/{session_id}")
             landed = json.loads(blob.download_as_text())
             landed["note"] = "instance restarted, session terminated"
+            # 舊格式落地狀態沒有 file_ids，補空清單讓欄位恆存在
+            landed.setdefault("file_ids", [])
             return landed
         except Exception:
             raise HTTPException(status_code=404, detail="錄製 session 不存在")
@@ -995,6 +997,7 @@ async def recording_status(session_id: str):
         "title": rec["title"],
         "elapsed_seconds": int(elapsed),
         "segments": rec["segments"],
+        "file_ids": _session_file_ids(rec),
         "error": rec.get("error"),
     }
 
@@ -1011,6 +1014,11 @@ RUNAWAY_CONSECUTIVE_LIMIT = 2
 MAX_SEGMENTS_PER_SESSION = 40
 
 
+def _session_file_ids(rec: dict) -> list:
+    """從 session 的 segments 取出已上傳的 file_id 清單（供 wait / collect）。"""
+    return [s.get("file_id") for s in rec.get("segments", []) if s.get("file_id")]
+
+
 def _write_session_state(bucket, session_id: str, rec: dict) -> None:
     """把錄製 session 摘要覆寫式落地 GCS（best-effort，不用鎖、不拋例外）。
     讓「實例重啟導致錄製中斷」變成可見狀態，而非 /recording_status 404 消失。
@@ -1021,6 +1029,9 @@ def _write_session_state(bucket, session_id: str, rec: dict) -> None:
             "status": rec.get("status"),
             "title": rec.get("title"),
             "segments": len(rec.get("segments", [])),
+            # 實例重啟後 /recording_status 只剩這份落地狀態，沒有 file_ids
+            # 外部 Agent 就無從 wait/collect 已上傳的段落。
+            "file_ids": _session_file_ids(rec),
             "error": rec.get("error"),
             "updated_at": time.time(),
         }))
