@@ -19,6 +19,8 @@
 | `wait <file_id...>` | 等多個切段全部完成（**輪詢即觸發翻譯，必跑**） | trigger 回傳 file_ids 之後 |
 | `collect <名稱> <file_id...>` | 等待+合併切段字幕（時間軸自動接續），輸出 output/<名稱>.srt 和 .txt | 準備寄結果前 |
 | `autostatus <vdvno>` | 查某 vdvno 的處理全貌（marker/session/失敗記錄），含 `vod_marker.file_ids` | trigger 排入 VOD 後，輪詢確認段數 |
+| `rescue <vdvno>` | YouTube 直播補救：本機解出直連網址餵後端開錄（**冪等**，已在錄會回 `already_recording`） | `live_failed` 出現「YouTube 直播無法後端錄製」時 |
+| `recstatus <session_id>` | 查錄製 session 狀態（含 `file_ids`） | rescue 開錄後，確認段數／取 file_id |
 | `mail --to ... --subject ... --body ... --attach ...` | 寄信 | 寄結果、警報、日報 |
 
 ## 值班流程
@@ -95,9 +97,23 @@
    連結，記錄新網址並在日報中註明。
 6. **不確定要不要通知：通知管理者。** 寧可多報。
 7. **`trigger` 回傳 `live_failed` 分類處理**：
-   - `last_failure.reason` 為「YouTube 直播無法後端錄製」→ 已知限制
-     （該場走 YouTube，後端錄不了），**不警報**；等會後官方上架 VOD，由
-     VOD 補抓流程處理即可。
+   - `last_failure.reason` 為「YouTube 直播無法後端錄製」→ **立即執行
+     `rescue <vdvno>`，不必等指示、不必問**。（後端在雲端被 YouTube 以
+     資料中心 IP 擋下，但你的機器可以解出直連網址餵回後端錄。過去的做法
+     是「等會後 VOD」，已證實不可靠：VOD 上架可能延遲數日甚至缺漏。）
+     執行方式二擇一，**預設用 (b)**：
+     - (a) `rescue <vdvno> --follow --until <該場議程結束時間+30分>`：
+       前景阻塞命令，會自己每 10 分鐘監控、斷線自己重解重錄、結束自己
+       收尾。**執行它的回合必須保持存活到會議結束**——你的執行環境若
+       無法長時間維持單一回合，不要用這個。結束後對總結 JSON 的
+       `file_ids` 走 wait / collect / mail。
+     - (b) **每 15 分鐘的排程喚醒各執行一次不帶 `--follow` 的
+       `rescue <vdvno>`**（與既有定點喚醒機制相容，故為預設）。冪等：
+       已在錄會回 `already_recording`（不是錯誤，不必警報）；斷線則該次
+       自動重解重錄補上。會議結束後用 `recstatus <session_id>` 取
+       `file_ids` 走 wait / collect / mail。
+   - `rescue` 本身失敗（非 `already_recording`）連續 2 次 → 警報信附
+     vdvno 與錯誤訊息。
    - 其他 `live_failed` 原因 → 列入當日日報「待處理/異常」，並視情況通知。
 8. **字幕完成但含未翻譯段落**（`untranslated_batches > 0`）→ 非故障，照
    結果交付第 4 點寄出並加註即可，不需警報。
@@ -115,7 +131,13 @@
 
 - 後端 API：`POST /auto_record_check`（X-Trigger-Secret 驗證）、
   `GET /auto_status/{vdvno}`（X-Trigger-Secret 驗證，查處理全貌）、
-  `GET /check_status/{file_id}?total_chunks=1`、`GET /health`。
+  `GET /check_status/{file_id}?total_chunks=1`、`GET /health`、
+  `POST /start_recording`（`rescue` 用；帶 `vdvno` 時強制 X-Trigger-Secret，
+  並與自動錄製共用同一把 live marker，故重複補救會回 409 而非開兩份）、
+  `GET /recording_status/{session_id}`（`recstatus` 用，回 `file_ids`）。
+- 為什麼 YouTube 場次要補救：後端跑在 Cloud Run，其 yt-dlp 會被 YouTube
+  以資料中心 IP 偵測擋下；你的機器（一般網路）解得出 googlevideo 直連
+  HLS 網址。該網址約 6 小時到期，`rescue` 的重錄機制會處理到期斷線。
 - 議會公開 API base：`https://live.tcc.gov.tw/iSharePortalWeb/api/`
   （SPW002 頻道、SPW003 直播中、SPW024 直播含預告、SPW046 頻道×日期
   的 VOD、SPW040 全檔案庫）。日期參數用西元 `yyyy/mm/dd`；用民國年會
