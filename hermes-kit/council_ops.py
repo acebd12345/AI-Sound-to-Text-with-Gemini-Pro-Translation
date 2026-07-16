@@ -11,6 +11,7 @@
   collect <輸出名> <file_id...>  等待+合併多切段字幕（時間軸自動位移），輸出 .srt/.txt
   autostatus <vdvno>            查某 vdvno 的處理全貌（marker/session/失敗記錄）
   rescue <vdvno> [--follow]     YouTube 直播補救：本機解直連網址餵後端開錄
+  recstatus <session_id>        查錄製 session 狀態（含 file_ids）
   today                         今天的直播與 VOD 概況（議會公開 API）
   mail --to a@b --subject S --body B [--attach f ...]   寄信（SMTP）
 
@@ -519,6 +520,11 @@ def cmd_rescue(args):
     print(json.dumps(_rescue_once(args), ensure_ascii=False, indent=1))
 
 
+def cmd_recstatus(args):
+    """查錄製 session 狀態（含 file_ids，供 wait / collect）。"""
+    print(json.dumps(_recording_status(args.session_id), ensure_ascii=False, indent=1))
+
+
 def cmd_today(_args):
     """今天概況：頻道直播旗標、OnAir 清單、今日+昨日 VOD。"""
     now = datetime.now(TW_TZ)
@@ -631,6 +637,10 @@ def main():
     p.add_argument("--until", default="19:00", help="--follow 的停止時間 HH:MM（台灣，預設 19:00）")
     p.add_argument("--interval", type=int, default=600, help="--follow 的監控間隔秒（預設 600）")
     p.set_defaults(func=cmd_rescue)
+
+    p = sub.add_parser("recstatus", help="查錄製 session 狀態（含 file_ids）")
+    p.add_argument("session_id")
+    p.set_defaults(func=cmd_recstatus)
 
     sub.add_parser("today").set_defaults(func=cmd_today)
 

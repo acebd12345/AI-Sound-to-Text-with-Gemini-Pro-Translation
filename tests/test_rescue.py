@@ -869,6 +869,42 @@ def test_http_json_body_encoding():
             fn()
 
 
+# ============ ③ kit recstatus ============
+
+def test_recstatus():
+    section("③ recstatus 原樣輸出（含 file_ids）")
+    import io
+    seen = {}
+    payload = {"status": "recording", "title": "大會", "elapsed_seconds": 120,
+               "segments": [{"file_id": "rec_A_seg0"}],
+               "file_ids": ["rec_A_seg0"], "error": None}
+
+    def _backend(path, method="GET", with_secret=False, timeout=60, json_body=None):
+        seen["path"] = path
+        return payload
+
+    undo = _patch(ops, "backend", _backend)
+    buf, orig_stdout = io.StringIO(), sys.stdout
+    sys.stdout = buf
+    try:
+        ops.cmd_recstatus(_Args(session_id="rec_A"))
+    finally:
+        sys.stdout = orig_stdout
+        undo()
+    check("打 /recording_status/<session_id>", seen["path"] == "/recording_status/rec_A")
+    check("原樣輸出 JSON（含 file_ids）", json.loads(buf.getvalue()) == payload)
+
+    # session_id 需經 URL 編碼
+    undo = _patch(ops, "backend", _backend)
+    sys.stdout = io.StringIO()
+    try:
+        ops.cmd_recstatus(_Args(session_id="rec A/b"))
+    finally:
+        sys.stdout = orig_stdout
+        undo()
+    check("session_id 經 URL 編碼", seen["path"] == "/recording_status/rec%20A/b")
+
+
 # ============ ② --follow 監控迴圈（可注入 clock / backend） ============
 
 class _FakeClock:
@@ -1033,6 +1069,7 @@ async def main_async():
     test_rescue_ytdlp_missing()
     test_rescue_409_is_success()
     test_http_json_body_encoding()
+    test_recstatus()
     test_follow_normal_stop()
     test_follow_restarts_on_error()
     test_follow_until_reached()
