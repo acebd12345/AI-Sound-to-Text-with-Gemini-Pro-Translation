@@ -1800,6 +1800,34 @@ async def auto_record_check(request: Request, background_tasks: BackgroundTasks)
     }
 
 
+@app.post("/fetch_vod/{vdvno}")
+async def fetch_vod(vdvno: str, request: Request, background_tasks: BackgroundTasks):
+    """單場 VOD 補抓（孤兒救援入口）。
+
+    /auto_record_check 的 VOD 掃描窗只涵蓋「今天+昨天」，官方延遲超過 48 小時
+    才上架的場次會永遠掃不到。此端點讓值班程式（duty）指名補抓，不受掃描窗限制。
+    行為與 auto_record_check 的單場 VOD 排入完全一致（同一把 marker，故冪等）。
+    """
+    _require_trigger_secret(request)
+
+    if not vdvno or not VDVNO_PATTERN.match(vdvno):
+        raise HTTPException(status_code=400, detail="Invalid vdvno")
+
+    auto_mode = os.getenv("AUTO_RECORD_MODE", "speech")
+    auto_diarize = os.getenv("AUTO_RECORD_DIARIZE", "false").strip().lower() in ("1", "true", "yes")
+    auto_known_names = os.getenv("AUTO_RECORD_KNOWN_NAMES", "")
+
+    bucket = storage_client.bucket(BUCKET_NAME)
+    if not claim_auto_state(bucket, "vod", vdvno):
+        raise HTTPException(status_code=409, detail="此 vdvno 的 VOD 已在處理中或已處理完成")
+
+    background_tasks.add_task(
+        fetch_vod_background, vdvno, auto_mode, auto_diarize, auto_known_names
+    )
+    print(f"[fetch_vod] VOD 指名排入 {vdvno}")
+    return {"queued": True, "file_id_prefix": f"vod_{vdvno[:8]}_seg"}
+
+
 def _read_auto_json_or_502(bucket, path: str):
     """讀取 GCS JSON。**區分 NotFound 與其他錯誤**：
     NotFound → 回 None（代表不存在）；權限/網路等真錯誤 → raise
