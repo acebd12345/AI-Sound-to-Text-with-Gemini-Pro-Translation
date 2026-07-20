@@ -1010,6 +1010,21 @@ SEGMENT_DURATION = 1800  # 30 分鐘
 RUNAWAY_SEGMENT_SECONDS = 300
 RUNAWAY_CONSECUTIVE_LIMIT = 2
 
+# 散會殘段偵測：直播結束後 ffmpeg 每輪仍可能連上串流並抓到數秒的殘段，
+# 牆鐘耗時卻可能長達數分鐘（重連等待），因而躲過上面的牆鐘煞車，導致
+# 一段段幾秒的垃圾持續進 GPU 管線。改看「媒體時長」：連續 2 段媒體時長
+# < 60 秒即判定串流已結束，該殘段不上傳。
+# 錄製格式固定為 16kHz mono 16-bit PCM WAV → 每秒 16000×2 = 32000 bytes，
+# 直接用檔案大小換算即可，不必另跑 ffprobe。
+WAV_BYTES_PER_SECOND = 32000
+SHORT_SEGMENT_SECONDS = 60
+SHORT_SEGMENT_CONSECUTIVE_LIMIT = 2
+
+
+def _wav_media_seconds(file_size: int) -> float:
+    """由 WAV 檔案大小推算媒體時長（秒）。header 44 bytes 相對誤差可忽略。"""
+    return file_size / WAV_BYTES_PER_SECOND
+
 # 單一 session 段數上限：40 段 = 20 小時，超過議會單日任何會議長度。
 MAX_SEGMENTS_PER_SESSION = 40
 
@@ -1043,7 +1058,8 @@ async def recording_loop(session_id, stream_url, mode, diarize, known_names):
     """背景任務：持續錄製串流，每 30 分鐘切一段上傳"""
     rec = active_recordings[session_id]
     segment_num = 0
-    fast_segment_streak = 0  # 連續「牆鐘過快完成」的段數
+    fast_segment_streak = 0   # 連續「牆鐘過快完成」的段數
+    short_segment_streak = 0  # 連續「媒體時長過短」的段數（散會殘段）
     bucket = storage_client.bucket(BUCKET_NAME)
 
     try:
@@ -1095,6 +1111,26 @@ async def recording_loop(session_id, stream_url, mode, diarize, known_names):
                     os.remove(local_path)
                 rec["error"] = f"串流已結束或錄製失敗（檔案 {file_size} bytes）"
                 break
+
+            # 散會殘段煞車：檔案有效但媒體時長極短（直播已結束，ffmpeg 每輪只
+            # 抓到幾秒殘響）。連續 SHORT_SEGMENT_CONSECUTIVE_LIMIT 段皆過短 →
+            # 判定串流結束，該殘段不上傳、刪除暫存、正常收尾。
+            media_seconds = _wav_media_seconds(file_size)
+            if media_seconds < SHORT_SEGMENT_SECONDS:
+                short_segment_streak += 1
+                print(f"[錄製] {session_id} 第 {segment_num} 段媒體時長僅 {media_seconds:.1f}s"
+                      f"（連續第 {short_segment_streak} 段過短）")
+                if short_segment_streak >= SHORT_SEGMENT_CONSECUTIVE_LIMIT:
+                    print(f"[殘段偵測] {session_id} 連續 {short_segment_streak} 段媒體時長 "
+                          f"< {SHORT_SEGMENT_SECONDS}s，判定串流已結束，停止錄製（殘段不上傳）")
+                    rec["stop"] = True
+                    rec["error"] = (f"串流結束（殘段偵測）：連續 {short_segment_streak} 段"
+                                    f"媒體時長 < {SHORT_SEGMENT_SECONDS} 秒")
+                    if os.path.exists(local_path):
+                        os.remove(local_path)
+                    break
+            else:
+                short_segment_streak = 0
 
             # 失控煞車：檔案有效但牆鐘完成太快（直播不可能 25 秒錄完 30 分鐘）。
             # 連續 RUNAWAY_CONSECUTIVE_LIMIT 段皆過快 → 判定失控，立即停止。
