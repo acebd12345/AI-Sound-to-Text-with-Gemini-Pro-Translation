@@ -14,7 +14,8 @@
   rescue <vdvno> [--follow]     YouTube 直播補救：本機解直連網址餵後端開錄
   recstatus <session_id>        查錄製 session 狀態（含 file_ids）
   today                         今天的直播與 VOD 概況（議會公開 API）
-  fetchvod <vdvno>              指名補抓單場 VOD（繞過今天+昨天的掃描窗）
+  fetchvod <vdvno> [--local]    指名補抓單場 VOD（繞過掃描窗）；--local 在台灣 IP
+                                本機下載切段餵回，繞過議會對海外 IP 的 404
   mail --to a@b --subject S --body B [--attach f ...]   寄信（SMTP）
 
 所有子命令輸出 JSON（stdout），失敗時 exit code != 0 並在 stderr 說明。
@@ -208,6 +209,11 @@ def _fetch_vod(vdvno: str) -> dict:
 
 
 def cmd_fetchvod(args):
+    # --local：在台灣 IP 的機器上本地下載→切段→餵回管線（繞過議會對海外 IP 的 404）。
+    # 不帶 --local 維持現狀：呼叫後端 /fetch_vod 由後端自行補抓。
+    if getattr(args, "local", False):
+        print(json.dumps(_fetchvod_local(args.vdvno), ensure_ascii=False, indent=1))
+        return
     print(json.dumps(_fetch_vod(args.vdvno), ensure_ascii=False, indent=1))
 
 
@@ -573,6 +579,194 @@ def cmd_recstatus(args):
     print(json.dumps(_recording_status(args.session_id), ensure_ascii=False, indent=1))
 
 
+# ---------- VOD 本地備援下載（fetchvod --local）----------
+# 背景：議會自家 tccstr 串流伺服器對海外 IP 回 404（實測台灣住宅/GCP
+# asia-east1 = 200，Cloud Run us-central1 = 404）。在台灣 IP 的 VM 本地
+# 用 ffmpeg 下載→切段→壓縮成 48kbps opus，再逐段餵回 /upload_chunk，
+# 就能繞過地理封鎖。與後端 _pick_vod_stream_url 同邏輯：最低畫質優先、
+# 同畫質 CDN 優先（CDN 較不做地理封鎖）。
+
+VODLOCAL_FFMPEG_TIMEOUT = 3600       # 整場下載+切段逾時（秒）
+# host 白名單：只允許議會自家網段與中華電信 topoo CDN（尾綴比對，與
+# main.py 的 ALLOWED_STREAM_DOMAINS 同義；不放寬到整個 hinet.net）。
+KIT_STREAM_HOST_SUFFIXES = ("tcc.gov.tw", "topoo.cdn.hinet.net")
+
+
+def _kit_is_cdn(url: str) -> bool:
+    host = (urllib.parse.urlparse(url or "").hostname or "").lower()
+    return host.endswith("topoo.cdn.hinet.net")
+
+
+def _kit_host_allowed(url: str) -> bool:
+    """只放行尾綴為 tcc.gov.tw 或 topoo.cdn.hinet.net 的 host。
+
+    用完整尾綴比對：`evil-topoo.cdn.hinet.net.attacker.com` 尾綴是
+    attacker.com 故不通過；其他 hinet.net 子網域也不通過。
+    """
+    host = (urllib.parse.urlparse(url or "").hostname or "").lower()
+    if not host:
+        return False
+    return any(host.endswith(s) for s in KIT_STREAM_HOST_SUFFIXES)
+
+
+def _kit_pick_vod_url(video_url_list: list) -> str:
+    """kit 自帶的 VOD 來源挑選，與後端 _pick_vod_stream_url 同邏輯：
+    最低畫質優先（480→720→1080→auto→任一），同畫質多來源時 CDN 優先。"""
+    if not video_url_list:
+        return ""
+
+    def _src(item):
+        return (item.get("src", "") or "") if isinstance(item, dict) else str(item)
+
+    def _label(item):
+        if isinstance(item, dict):
+            for k in ("definition", "quality", "title", "label", "name"):
+                v = item.get(k)
+                if v:
+                    return str(v).lower()
+        return _src(item).lower()
+
+    def _prefer_cdn(srcs):
+        for s in srcs:
+            if _kit_is_cdn(s):
+                return s
+        return srcs[0] if srcs else ""
+
+    for pref in ("480", "720", "1080"):
+        m = [_src(i) for i in video_url_list if pref in _label(i) and _src(i)]
+        if m:
+            return _prefer_cdn(m)
+    autos = [_src(i) for i in video_url_list if "auto" in _label(i) and _src(i)]
+    if autos:
+        return _prefer_cdn(autos)
+    return _prefer_cdn([_src(i) for i in video_url_list if _src(i)])
+
+
+def _portal_video_data(vdvno: str) -> dict:
+    """打 SPW010_VideoData 取原始 dict（含 VideoURLList 多畫質清單）。"""
+    data = portal("SPW010_VideoData", {"vdv_vdvno": vdvno})
+    if isinstance(data, list) and data:
+        data = data[0]
+    if not isinstance(data, dict):
+        die(f"SPW010_VideoData 查無 {vdvno} 的資料")
+    return data
+
+
+def _encode_multipart(fields: dict, files: list, boundary: str) -> bytes:
+    """標準庫自組 multipart/form-data body。
+
+    fields: {name: value}（value 轉字串）
+    files:  [(field_name, filename, content_type, bytes)]
+    """
+    crlf = b"\r\n"
+    b = boundary.encode("ascii")
+    parts = []
+    for name, value in fields.items():
+        parts.append(b"--" + b)
+        parts.append(('Content-Disposition: form-data; name="%s"' % name).encode("utf-8"))
+        parts.append(b"")
+        parts.append(str(value).encode("utf-8"))
+    for field_name, filename, content_type, content in files:
+        parts.append(b"--" + b)
+        parts.append(('Content-Disposition: form-data; name="%s"; filename="%s"'
+                      % (field_name, filename)).encode("utf-8"))
+        parts.append(("Content-Type: %s" % content_type).encode("utf-8"))
+        parts.append(b"")
+        parts.append(content)
+    parts.append(b"--" + b + b"--")
+    parts.append(b"")
+    return crlf.join(parts)
+
+
+def _post_multipart(url: str, fields: dict, files: list, headers: dict = None,
+                    timeout: int = 300) -> dict:
+    """multipart/form-data POST（http_json 只支援 JSON，這裡自組 body）。
+
+    boundary 自訂並帶隨機尾碼避免與內容碰撞；不引入第三方套件。
+    """
+    import uuid
+    boundary = "----councilkitboundary" + uuid.uuid4().hex
+    body = _encode_multipart(fields, files, boundary)
+    h = dict(headers or {})
+    h["Content-Type"] = "multipart/form-data; boundary=" + boundary
+    h["Content-Length"] = str(len(body))
+    req = urllib.request.Request(url, data=body, method="POST", headers=h)
+    with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as resp:
+        raw = resp.read()
+    return _decode_json(raw)
+
+
+def _kit_upload_segment(file_id: str, content: bytes, mode: str = "speech") -> dict:
+    """把一段本地音檔以 multipart 餵回後端 /upload_chunk（單塊、chunk 0/1）。"""
+    if not CFG.get("SYSTEM_URL"):
+        die("缺少 SYSTEM_URL（設定環境變數或 hermes-kit/.env）")
+    fields = {
+        "chunk_index": "0",
+        "total_chunks": "1",
+        "file_id": file_id,
+        "mode": mode,
+        "diarize": "false",
+        "known_names": "",
+    }
+    files = [("file_chunk", file_id + ".ogg", "audio/ogg", content)]
+    return _post_multipart(CFG["SYSTEM_URL"] + "/upload_chunk", fields, files)
+
+
+def _fetchvod_local(vdvno: str) -> dict:
+    """本地備援：ffmpeg 下載→切段壓縮→逐段 /upload_chunk 餵回管線。
+
+    僅在台灣 IP 的機器有意義（繞過議會對海外 IP 的 404）。輸出：
+    {"method":"local","vdvno":...,"file_ids":[...],"segments":N}
+    """
+    if not VDVNO_RE.match(vdvno or ""):
+        die(f"vdvno 格式不符（需 8-64 碼英數或 hyphen）: {vdvno!r}")
+    import glob
+    import shutil
+    import subprocess
+    import tempfile
+
+    if not shutil.which("ffmpeg"):
+        die("找不到 ffmpeg。請先安裝：sudo apt install -y ffmpeg")
+
+    data = _portal_video_data(vdvno)
+    url = _kit_pick_vod_url(data.get("VideoURLList", []) or []) or data.get("vdv_url", "") or ""
+    if not url:
+        die(f"{vdvno} 查無可用串流網址")
+    if not _kit_host_allowed(url):
+        die(f"串流網址網域不在白名單內（僅允許尾綴 tcc.gov.tw / "
+            f"topoo.cdn.hinet.net）: {url}")
+
+    short = vdvno[:8]
+    tmpdir = tempfile.mkdtemp(prefix=f"vodlocal_{short}_")
+    pattern = os.path.join(tmpdir, f"vodlocal_{short}_%03d.ogg")
+    cmd = [
+        "ffmpeg", "-y", "-user_agent", "Mozilla/5.0", "-i", url, "-vn",
+        "-c:a", "libopus", "-b:a", "48k", "-ar", "16000", "-ac", "1",
+        "-f", "segment", "-segment_time", str(SEGMENT_SECONDS), pattern,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=VODLOCAL_FFMPEG_TIMEOUT)
+        if proc.returncode != 0:
+            die(f"ffmpeg 下載/切段失敗 (exit {proc.returncode}): "
+                f"{proc.stderr.decode(errors='replace')[-300:].strip()}")
+
+        segs = sorted(glob.glob(os.path.join(tmpdir, f"vodlocal_{short}_*.ogg")))
+        if not segs:
+            die(f"{vdvno} ffmpeg 未產生任何切段")
+
+        file_ids = []
+        for i, seg in enumerate(segs):
+            fid = f"vodlocal_{short}_seg{i}"
+            _kit_upload_segment(fid, Path(seg).read_bytes())
+            file_ids.append(fid)
+            os.remove(seg)          # 上傳成功即刪本地暫存段
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    return {"method": "local", "vdvno": vdvno, "file_ids": file_ids,
+            "segments": len(file_ids)}
+
+
 def _today() -> dict:
     """今天概況：頻道直播旗標、OnAir 清單、今日+昨日 VOD。"""
     now = datetime.now(TW_TZ)
@@ -673,6 +867,8 @@ DUTY_ALERT_MAX_PER_DAY = 2        # 同一事由每日告警上限
 DUTY_DONE_RETENTION_DAYS = 30     # done 清單保留天數（供日報統計）
 DUTY_REPORT_HOUR = 22             # 日報時間（台灣，當日 >= 此小時發一次）
 DUTY_YT_RESCUE_REASON = "YouTube 直播無法後端錄製"
+DUTY_VOD_404_SWITCH_ROUNDS = 2    # VOD 連續幾輪 404（議會對海外 IP 地理封鎖）後改走本地下載
+DUTY_LOCAL_FAIL_ALERT = 2         # 本地下載連續幾輪失敗才告警
 
 
 def _duty_state_path() -> Path:
@@ -734,6 +930,7 @@ def _duty_default_deps() -> dict:
         "collect": _collect_from_results,
         "mail": _send_mail,
         "fetch_vod": _fetch_vod,
+        "fetch_vod_local": _fetchvod_local,
         "state_path": _duty_state_path(),
         "out_dir": KIT_DIR / "output",
     }
@@ -749,7 +946,7 @@ class _Duty:
         self.state = _duty_load_state(deps["state_path"])
         self.counts = {"vods_tracked": 0, "segments_learned": 0, "rescued": 0,
                        "sessions_finalized": 0, "delivered": 0, "orphans_retried": 0,
-                       "alerts_sent": 0, "report_sent": 0, "errors": 0}
+                       "local_fetched": 0, "alerts_sent": 0, "report_sent": 0, "errors": 0}
         self._onair_cache = None   # None=未查，list=已查（可能為空）
         self._notes = []
 
@@ -782,6 +979,18 @@ class _Duty:
         """
         return any(isinstance(d, dict) and d.get("vdvno") == vdvno
                    for d in self.state["done"])
+
+    def handled_by_local(self, vdvno: str) -> bool:
+        """某 vdvno 已由本地下載路徑處理（追蹤中或已交付）。
+
+        後端稍後可能自行補抓成功而再度出現在 vods_queued；若照收會造成
+        第二份 GPU 處理與重複寄信。此判斷用來忽略那些重複的排入。
+        """
+        t = self.state["tracking"].get(vdvno)
+        if isinstance(t, dict) and t.get("method") == "local":
+            return True
+        return any(isinstance(d, dict) and d.get("vdvno") == vdvno
+                   and d.get("method") == "local" for d in self.state["done"])
 
     def track(self, vdvno: str, title: str, source: str):
         if self.is_done(vdvno):
@@ -855,6 +1064,10 @@ class _Duty:
             vdvno = entry.get("vdvno")
             if not vdvno:
                 continue
+            # 已由本地路徑接手的場次，忽略後端稍後成功造成的重複排入
+            if self.handled_by_local(vdvno):
+                self.note(f"{vdvno} 已由本地路徑處理，忽略本次 vods_queued（防重複）")
+                continue
             if self.track(vdvno, entry.get("title") or "", "vod"):
                 self.counts["vods_tracked"] += 1
 
@@ -888,6 +1101,61 @@ class _Duty:
                 # 不告警：官方尚未上架等原因系統會自動重試，屬正常等待
                 t["vod_failure"] = failure.get("reason") or str(failure)
                 self.note(f"{vdvno} VOD 尚未取得段數：{t['vod_failure']}")
+                # 404 地理封鎖：連續 ≥2 輪且尚未走本地路徑 → 切本地下載
+                if self._is_404_failure(failure):
+                    t["vod_404_streak"] = int(t.get("vod_404_streak") or 0) + 1
+                    if (t["vod_404_streak"] >= DUTY_VOD_404_SWITCH_ROUNDS
+                            and t.get("method") != "local"):
+                        self.switch_to_local(t)
+                else:
+                    t["vod_404_streak"] = 0
+
+    @staticmethod
+    def _is_404_failure(failure) -> bool:
+        """VOD 失敗記錄是否為 404（議會對海外 IP 的地理封鎖）。
+
+        後端把 ffmpeg 錯誤寫進 detail（含「Server returned 404」等字樣），
+        reason 也可能含 404，兩處任一命中即算。
+        """
+        if not isinstance(failure, dict):
+            return False
+        blob = f"{failure.get('detail', '')} {failure.get('reason', '')}"
+        return "404" in blob
+
+    def switch_to_local(self, t: dict):
+        """改走本地下載路徑（台灣 IP 的 VM 上 ffmpeg 下載切段餵回）。"""
+        vdvno = t["vdvno"]
+        try:
+            r = self.deps["fetch_vod_local"](vdvno)
+        except (Exception, SystemExit) as e:
+            self.on_local_failed(t, e)
+            return
+        fids = (r or {}).get("file_ids") or []
+        if not fids:
+            self.on_local_failed(t, "本地下載未取得任何 file_ids")
+            return
+        t["method"] = "local"
+        t["local_fail_streak"] = 0
+        t["vod_failure"] = None
+        self.add_file_ids(t, fids)
+        self.counts["local_fetched"] += 1
+        self.note(f"{vdvno} 連續 404 → 改走本地下載，取得 {len(fids)} 段")
+
+    def on_local_failed(self, t: dict, err):
+        """本地下載連續失敗告警（沿用既有節流）。"""
+        vdvno = t["vdvno"]
+        t["local_fail_streak"] = int(t.get("local_fail_streak") or 0) + 1
+        streak = t["local_fail_streak"]
+        self.counts["errors"] += 1
+        self.note(f"{vdvno} 本地下載失敗（連續第 {streak} 輪）: {err}")
+        if streak >= DUTY_LOCAL_FAIL_ALERT:
+            self.alert(
+                f"local_failed:{vdvno}",
+                f"[議會值班] 本地下載連續失敗 {streak} 輪：{t.get('title') or vdvno}",
+                f"vdvno: {vdvno}\n標題: {t.get('title')}\n"
+                f"時間: {self.now:%Y/%m/%d %H:%M}\n錯誤: {err}\n\n"
+                f"議會伺服器對海外 IP 回 404，改走本地下載仍失敗，屬需人工了解的異常。",
+            )
 
     def step_rescue(self, trig: dict):
         """live_failed 中的 YouTube 場次補救，含殭屍防護。"""
@@ -1043,6 +1311,7 @@ class _Duty:
         self.state["done"].append({
             "vdvno": vdvno, "title": title, "done_at": self.now.timestamp(),
             "date": self.today_str, "segments": out["segments_done"],
+            "method": t.get("method"),   # "local" 者供 handled_by_local 去重
             "partial": bool(out.get("partial")),
             "partial_translation": bool(out.get("partial_translation")),
         })
@@ -1201,6 +1470,8 @@ def main():
 
     p = sub.add_parser("fetchvod", help="指名補抓單場 VOD（不受今天+昨天掃描窗限制）")
     p.add_argument("vdvno")
+    p.add_argument("--local", action="store_true",
+                   help="在本機（台灣 IP）下載→切段→餵回管線，繞過議會對海外 IP 的 404")
     p.set_defaults(func=cmd_fetchvod)
 
     p = sub.add_parser("duty", help="自動值班單趟（cron 每 15 分鐘呼叫；冪等）")

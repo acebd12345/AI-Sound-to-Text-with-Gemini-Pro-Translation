@@ -156,6 +156,8 @@ class _Harness:
         self.onair = []
         self.rescue_impl = None
         self.fetch_vod_calls = []
+        self.fetch_vod_local_calls = []
+        self.fetch_vod_local_impl = None
         self.mails = []
         self.collects = []
         self.rescue_calls = []
@@ -191,6 +193,15 @@ class _Harness:
         self.fetch_vod_calls.append(vdvno)
         return {"queued": True}
 
+    def _fetch_vod_local(self, vdvno):
+        self.fetch_vod_local_calls.append(vdvno)
+        if self.fetch_vod_local_impl:
+            return self.fetch_vod_local_impl(vdvno)
+        short = vdvno[:8]
+        return {"method": "local", "vdvno": vdvno,
+                "file_ids": [f"vodlocal_{short}_seg0", f"vodlocal_{short}_seg1"],
+                "segments": 2}
+
     def deps(self):
         return {
             "now": lambda: self.now_dt,
@@ -203,6 +214,7 @@ class _Harness:
             "collect": self._collect,
             "mail": self._mail,
             "fetch_vod": self._fetch_vod,
+            "fetch_vod_local": self._fetch_vod_local,
             "state_path": self.state_path,
             "out_dir": self.out_dir,
         }
@@ -854,6 +866,280 @@ def test_kit_fetchvod_command():
         ops.backend = orig
 
 
+# ============ ⑪ 地理封鎖備援：CDN 白名單 / 挑選 / is_vod_url / multipart / --local ============
+
+def test_cdn_whitelist_backend():
+    section("⑪ 後端白名單：CDN 通過、偽裝/其他 hinet 子網域不通過")
+    check("ALLOWED_STREAM_DOMAINS 含 topoo CDN",
+          "topoo.cdn.hinet.net" in main.ALLOWED_STREAM_DOMAINS)
+    check("未放寬到整個 hinet.net / cdn.hinet.net",
+          "hinet.net" not in main.ALLOWED_STREAM_DOMAINS
+          and "cdn.hinet.net" not in main.ALLOWED_STREAM_DOMAINS)
+
+    orig = main.socket.getaddrinfo
+    main.socket.getaddrinfo = lambda host, *a, **k: [(2, 1, 6, "", ("1.2.3.4", 0))]
+    try:
+        # 用非 .m3u8 路徑隔離「網域白名單」判斷（.m3u8 會走 is_direct_stream 旁路）
+        ok = "https://tccstr2-topoo.cdn.hinet.net/tccvod/mp4:x/playlist"
+        check("CDN host 通過", main.validate_stream_url(ok) == ok)
+        for bad in ("https://evil-topoo.cdn.hinet.net.attacker.com/tccvod/x/playlist",
+                    "https://other.hinet.net/tccvod/x/playlist",
+                    "https://cdn.hinet.net/tccvod/x/playlist"):
+            try:
+                main.validate_stream_url(bad)
+                check(f"偽裝/他網域應擋 {bad[:40]}", False)
+            except HTTPException as e:
+                check(f"擋下 {bad.split('//')[1][:38]}…", e.status_code == 400)
+    finally:
+        main.socket.getaddrinfo = orig
+
+
+def test_cdn_whitelist_kit():
+    section("⑪ kit host 白名單：尾綴比對")
+    check("CDN host 通過",
+          ops._kit_host_allowed("https://tccstr2-topoo.cdn.hinet.net/tccvod/x/playlist.m3u8"))
+    check("議會自家 host 通過",
+          ops._kit_host_allowed("https://tccstr2.tcc.gov.tw/tccvod/x/playlist.m3u8"))
+    check("偽裝 host 不通過",
+          not ops._kit_host_allowed("https://evil-topoo.cdn.hinet.net.attacker.com/x.m3u8"))
+    check("hinet.net 其他子網域不通過",
+          not ops._kit_host_allowed("https://other.hinet.net/tccvod/x.m3u8"))
+    check("cdn.hinet.net 不通過",
+          not ops._kit_host_allowed("https://cdn.hinet.net/tccvod/x.m3u8"))
+    check("空/無 host 不通過", not ops._kit_host_allowed(""))
+
+
+def test_pick_prefers_cdn():
+    section("⑪ 挑選：同畫質 CDN 優先、只有 tccstr 照舊、最低畫質優先")
+    tccstr_480 = "https://tccstr2.tcc.gov.tw/tccvod/mp4:x_480/playlist.m3u8"
+    cdn_480 = "https://tccstr2-topoo.cdn.hinet.net/tccvod/mp4:x_480/playlist.m3u8"
+    cdn_720 = "https://tccstr2-topoo.cdn.hinet.net/tccvod/mp4:x_720/playlist.m3u8"
+    same_q = [{"definition": "480P", "src": tccstr_480},
+              {"definition": "480P", "src": cdn_480}]
+    only_tccstr = [{"definition": "480P", "src": tccstr_480}]
+    mixed_q = [{"definition": "720P", "src": cdn_720},
+               {"definition": "480P", "src": tccstr_480}]
+    for name, fn in (("後端", main._pick_vod_stream_url), ("kit", ops._kit_pick_vod_url)):
+        check(f"{name}：同畫質選 CDN", fn(same_q) == cdn_480)
+        check(f"{name}：只有 tccstr 照舊", fn(only_tccstr) == tccstr_480)
+        check(f"{name}：仍最低畫質優先（480 tccstr 勝 720 CDN）", fn(mixed_q) == tccstr_480)
+
+
+def test_is_vod_url_cdn():
+    section("⑪ is_vod_url 對 CDN 路徑為 True")
+    check("CDN /tccvod/ 判為 VOD",
+          main.is_vod_url("https://tccstr2-topoo.cdn.hinet.net/tccvod/mp4:x/playlist.m3u8"))
+    check("議會自家 /tccvod/ 仍為 VOD",
+          main.is_vod_url("https://tccstr2.tcc.gov.tw/tccvod/smil:x.smil/playlist.m3u8"))
+    check("直播 live 路徑非 VOD",
+          not main.is_vod_url("https://live.tcc.gov.tw/live/x/playlist.m3u8"))
+
+
+def test_multipart_encoding():
+    section("⑪ multipart 編碼：boundary/欄位/檔名/Content-Type")
+    boundary = "----councilkitboundaryTEST"
+    fields = {"chunk_index": "0", "total_chunks": "1",
+              "file_id": "vodlocal_c24694f6_seg0", "mode": "speech"}
+    files = [("file_chunk", "vodlocal_c24694f6_seg0.ogg", "audio/ogg", b"OGGDATA")]
+    body = ops._encode_multipart(fields, files, boundary)
+    text = body.decode("utf-8")
+    b = "--" + boundary
+    check("以 boundary 起始", text.startswith(b + "\r\n"))
+    check("以 close-boundary 結束", text.rstrip("\r\n").endswith(b + "--"))
+    check("含 file_id 欄位", 'Content-Disposition: form-data; name="file_id"' in text)
+    check("含 file_id 值", "vodlocal_c24694f6_seg0" in text)
+    check("含 mode=speech", 'name="mode"' in text and "speech" in text)
+    check("檔案欄名與檔名正確",
+          'name="file_chunk"; filename="vodlocal_c24694f6_seg0.ogg"' in text)
+    check("檔案 Content-Type", "Content-Type: audio/ogg" in text)
+    check("含檔案內容", "OGGDATA" in text)
+    check("CRLF 分隔", "\r\n" in text)
+
+    captured = {}
+
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b'{"status":"uploaded","index":0}'
+
+    def _fake_urlopen(req, timeout=None, context=None):
+        captured["ct"] = req.headers.get("Content-type")
+        captured["data"] = req.data
+        captured["method"] = req.get_method()
+        return _Resp()
+
+    orig = ops.urllib.request.urlopen
+    ops.urllib.request.urlopen = _fake_urlopen
+    try:
+        r = ops._post_multipart("https://x/upload_chunk", fields, files)
+        check("_post_multipart 回傳解析後 JSON", r["status"] == "uploaded")
+        check("Content-Type 帶 multipart+boundary",
+              captured["ct"].startswith("multipart/form-data; boundary=----councilkitboundary"))
+        check("以 POST 送出", captured["method"] == "POST")
+        check("body 內含 boundary 尾碼",
+              captured["ct"].split("boundary=")[1].encode() in captured["data"])
+    finally:
+        ops.urllib.request.urlopen = orig
+
+
+def test_fetchvod_local_success():
+    section("⑪ fetchvod --local：SPW010→ffmpeg→upload → file_ids 正確")
+    import shutil as _shutil
+    import subprocess as _sp
+    vd = "c24694f6-9700-47c5-a228-1b29007cdf30"
+    uploaded = []
+
+    def _fake_pvd(vdvno):
+        return {"vdv_title": "程序委員會", "VideoURLList": [{"definition": "480P",
+                "src": "https://tccstr2-topoo.cdn.hinet.net/tccvod/mp4:x_480/playlist.m3u8"}]}
+
+    def _fake_run(cmd, capture_output=True, timeout=None):
+        pattern = cmd[-1]                       # .../vodlocal_c24694f6_%03d.ogg
+        for i in range(2):
+            Path(pattern % i).write_bytes(b"FAKEOGG")
+        return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    def _fake_upload(file_id, content, mode="speech"):
+        uploaded.append((file_id, content, mode))
+        return {"status": "uploaded"}
+
+    saved = (ops._portal_video_data, ops._kit_upload_segment, _shutil.which, _sp.run)
+    ops._portal_video_data = _fake_pvd
+    ops._kit_upload_segment = _fake_upload
+    _shutil.which = lambda name: "/usr/bin/ffmpeg"
+    _sp.run = _fake_run
+    try:
+        out = ops._fetchvod_local(vd)
+        check("method 為 local", out["method"] == "local")
+        check("file_ids 正確",
+              out["file_ids"] == ["vodlocal_c24694f6_seg0", "vodlocal_c24694f6_seg1"])
+        check("segments == 2", out["segments"] == 2)
+        check("上傳兩段", len(uploaded) == 2)
+        check("上傳內容正確", uploaded[0][1] == b"FAKEOGG")
+        check("上傳 mode=speech", uploaded[0][2] == "speech")
+    finally:
+        (ops._portal_video_data, ops._kit_upload_segment, _shutil.which, _sp.run) = saved
+
+
+def test_fetchvod_local_no_ffmpeg():
+    section("⑪ fetchvod --local：ffmpeg 缺失報錯")
+    import shutil as _shutil
+    saved = _shutil.which
+    _shutil.which = lambda name: None
+    try:
+        ops._fetchvod_local("c24694f6-9700-47c5-a228-1b29007cdf30")
+        check("ffmpeg 缺失應 exit", False)
+    except SystemExit:
+        check("ffmpeg 缺失 → SystemExit（報錯附安裝提示）", True)
+    finally:
+        _shutil.which = saved
+
+
+def test_fetchvod_local_host_rejected():
+    section("⑪ fetchvod --local：host 白名單拒絕")
+    import shutil as _shutil
+    saved = (ops._portal_video_data, _shutil.which)
+    ops._portal_video_data = lambda vdvno: {"VideoURLList": [{"definition": "480P",
+        "src": "https://evil-topoo.cdn.hinet.net.attacker.com/x.m3u8"}]}
+    _shutil.which = lambda name: "/usr/bin/ffmpeg"
+    try:
+        ops._fetchvod_local("c24694f6-9700-47c5-a228-1b29007cdf30")
+        check("非白名單 host 應 exit", False)
+    except SystemExit:
+        check("非白名單 host → SystemExit（不下載）", True)
+    finally:
+        (ops._portal_video_data, _shutil.which) = saved
+
+
+@_with_emails
+def test_duty_404_switch_after_two_rounds():
+    section("⑪ duty 404：重試 2 輪後才切本地下載")
+    with tempfile.TemporaryDirectory() as td:
+        h = _Harness(td)
+        h.trigger_result = {"vods_queued": [{"vdvno": VDVNO, "title": "警政衛生"}]}
+        h.autostatus_map[VDVNO] = {"vod_failure": {
+            "reason": "下載失敗", "detail": "ffmpeg: Server returned 404 Not Found"}}
+        out1 = h.run()
+        st1 = h.state()["tracking"][VDVNO]
+        check("第 1 輪不切（未達門檻）", len(h.fetch_vod_local_calls) == 0)
+        check("第 1 輪 404 streak=1", st1.get("vod_404_streak") == 1)
+        check("第 1 輪未標 local", st1.get("method") != "local")
+        check("第 1 輪 local_fetched=0", out1["local_fetched"] == 0)
+
+        out2 = h.run()
+        st2 = h.state()["tracking"][VDVNO]
+        check("第 2 輪切本地", h.fetch_vod_local_calls == [VDVNO])
+        check("標記 method=local", st2.get("method") == "local")
+        check("取得本地 file_ids",
+              st2["file_ids"] == ["vodlocal_d45ff137_seg0", "vodlocal_d45ff137_seg1"])
+        check("vod_failure 已清", st2.get("vod_failure") is None)
+        check("local_fetched 計數", out2["local_fetched"] == 1)
+
+
+@_with_emails
+def test_duty_non_404_never_switches():
+    section("⑪ duty：非 404 失敗（尚未上架）不切本地")
+    with tempfile.TemporaryDirectory() as td:
+        h = _Harness(td)
+        h.trigger_result = {"vods_queued": [{"vdvno": VDVNO, "title": "大會"}]}
+        h.autostatus_map[VDVNO] = {"vod_failure": {
+            "reason": "官方尚未上架 HLS（YouTube URL）", "detail": ""}}
+        for _ in range(4):
+            h.run()
+        st = h.state()["tracking"][VDVNO]
+        check("多輪後仍不切本地", len(h.fetch_vod_local_calls) == 0)
+        check("404 streak 維持 0", st.get("vod_404_streak", 0) == 0)
+
+
+@_with_emails
+def test_duty_404_dedup_ignores_requeued():
+    section("⑪ duty 404：切換後同 vdvno 的 vods_queued 被忽略（防重複）")
+    with tempfile.TemporaryDirectory() as td:
+        h = _Harness(td)
+        h.trigger_result = {"vods_queued": [{"vdvno": VDVNO, "title": "警政衛生"}]}
+        h.autostatus_map[VDVNO] = {"vod_failure": {
+            "reason": "下載失敗", "detail": "Server returned 404"}}
+        h.run(); h.run()                        # 兩輪後切本地
+        check("已切本地", h.state()["tracking"][VDVNO].get("method") == "local")
+        local_fids = list(h.state()["tracking"][VDVNO]["file_ids"])
+
+        # 後端稍後自行補抓成功：vods_queued 再現同 vdvno 且 autostatus 出現 vod_marker
+        h.autostatus_map[VDVNO] = {"vod_marker": {"file_ids":
+            ["vod_d45ff137_seg0", "vod_d45ff137_seg1", "vod_d45ff137_seg2"]}}
+        out3 = h.run()
+        st = h.state()["tracking"][VDVNO]
+        check("仍只有一份追蹤", len(h.state()["tracking"]) == 1)
+        check("第 3 輪未新增追蹤計數", out3["vods_tracked"] == 0)
+        check("不吸收後端 vod_marker 的段", st["file_ids"] == local_fids)
+        check("method 仍為 local", st.get("method") == "local")
+        check("未再打本地下載", len(h.fetch_vod_local_calls) == 1)
+
+
+@_with_emails
+def test_duty_404_local_fail_alerts_after_two():
+    section("⑪ duty 404：本地下載連續 2 輪失敗 → 告警 ADMIN")
+    with tempfile.TemporaryDirectory() as td:
+        h = _Harness(td)
+        h.trigger_result = {"vods_queued": [{"vdvno": VDVNO, "title": "警政衛生"}]}
+        h.autostatus_map[VDVNO] = {"vod_failure": {
+            "reason": "下載失敗", "detail": "Server returned 404"}}
+        h.fetch_vod_local_impl = lambda v: (_ for _ in ()).throw(RuntimeError("本地也 404"))
+
+        h.run()   # r1: streak=1，未切
+        h.run()   # r2: streak=2 → 切 → 失敗 → local_fail_streak=1，未告警
+        check("第 1 次本地失敗不告警", len(h.mails) == 0)
+        check("local_fail_streak=1",
+              h.state()["tracking"][VDVNO].get("local_fail_streak") == 1)
+
+        h.run()   # r3: 再切 → 失敗 → local_fail_streak=2 → 告警
+        check("第 2 次本地失敗告警", len(h.mails) == 1)
+        check("告警寄 ADMIN", h.mails[0]["to"] == ["admin@example.com"])
+        check("告警主旨含本地下載", "本地下載" in h.mails[0]["subject"])
+        check("local_fail_streak=2",
+              h.state()["tracking"][VDVNO].get("local_fail_streak") == 2)
+        check("兩次本地下載嘗試", len(h.fetch_vod_local_calls) == 2)
+
+
 # ============ 執行 ============
 
 async def main_async():
@@ -880,6 +1166,19 @@ async def main_async():
     await test_tiny_file_brake_still_works()
     await test_fetch_vod_endpoint()
     test_kit_fetchvod_command()
+    # ⑪ 地理封鎖備援：CDN 白名單 / 挑選 / is_vod_url / multipart / --local / duty 404 切換
+    test_cdn_whitelist_backend()
+    test_cdn_whitelist_kit()
+    test_pick_prefers_cdn()
+    test_is_vod_url_cdn()
+    test_multipart_encoding()
+    test_fetchvod_local_success()
+    test_fetchvod_local_no_ffmpeg()
+    test_fetchvod_local_host_rejected()
+    test_duty_404_switch_after_two_rounds()
+    test_duty_non_404_never_switches()
+    test_duty_404_dedup_ignores_requeued()
+    test_duty_404_local_fail_alerts_after_two()
 
 
 if __name__ == "__main__":
