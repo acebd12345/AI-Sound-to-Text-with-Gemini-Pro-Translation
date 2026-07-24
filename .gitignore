@@ -18,3 +18,7 @@ final_results/
 hermes-kit/secret.txt
 hermes-kit/.env
 hermes-kit/output/
+# duty 值班狀態（部署者建立，各機器內容不同，不入版控）
+hermes-kit/duty_state.json
+hermes-kit/duty_state.json.tmp
+hermes-kit/*.log
