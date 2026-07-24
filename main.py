@@ -486,8 +486,12 @@ active_recordings: dict = {}
 # URL 白名單驗證（防止 SSRF）
 # 用 endswith 比對，"tcc.gov.tw" 涵蓋 live.tcc.gov.tw（直播）與
 # tccstr2.tcc.gov.tw（VOD 自家 HLS）等台北市議會網段。
+# "topoo.cdn.hinet.net"：議會 7/22 起部分 VOD 走中華電信 CDN（路徑仍含
+# /tccvod/），host 如 tccstr2-topoo.cdn.hinet.net。用完整尾綴比對，
+# 只放行 topoo.cdn.hinet.net 家族，不放寬到整個 hinet.net 或 cdn.hinet.net。
 ALLOWED_STREAM_DOMAINS = [
     "tcc.gov.tw",
+    "topoo.cdn.hinet.net",
 ]
 
 def _is_disallowed_ip(ip_str: str) -> bool:
@@ -1421,7 +1425,10 @@ VOD_DOWNLOAD_TIMEOUT = 3600  # 整體下載+切段的 timeout（秒）
 
 def _pick_vod_stream_url(video_url_list: list) -> str:
     """從 VideoURLList 挑最低畫質的 m3u8（音訊轉錄不需高畫質，省頻寬）。
-    優先順序：480p → 720p → 1080p → auto → 任一筆。"""
+    優先順序：480p → 720p → 1080p → auto → 任一筆。
+    同一畫質有多個來源時，優先選 host 以 topoo.cdn.hinet.net 結尾者——
+    議會自家 tccstr 伺服器對海外 IP 回 404，中華電信 CDN 較不做地理封鎖，
+    海外部署較可能成功。"""
     if not video_url_list:
         return ""
 
@@ -1439,20 +1446,29 @@ def _pick_vod_stream_url(video_url_list: list) -> str:
                     return str(v).lower()
         return _src(item).lower()
 
+    def _is_cdn(src: str) -> bool:
+        from urllib.parse import urlparse
+        host = (urlparse(src).hostname or "").lower()
+        return host.endswith("topoo.cdn.hinet.net")
+
+    def _prefer_cdn(srcs: list) -> str:
+        # 同組候選裡 CDN 來源優先；無 CDN 則維持原順序（照舊回第一筆）
+        for s in srcs:
+            if _is_cdn(s):
+                return s
+        return srcs[0] if srcs else ""
+
     # 畫質偏好由低到高
     for pref in ("480", "720", "1080"):
-        for item in video_url_list:
-            if pref in _label(item) and _src(item):
-                return _src(item)
+        matches = [_src(i) for i in video_url_list if pref in _label(i) and _src(i)]
+        if matches:
+            return _prefer_cdn(matches)
     # 再退回 auto
-    for item in video_url_list:
-        if "auto" in _label(item) and _src(item):
-            return _src(item)
+    autos = [_src(i) for i in video_url_list if "auto" in _label(i) and _src(i)]
+    if autos:
+        return _prefer_cdn(autos)
     # 最後退回任一筆有 src 的
-    for item in video_url_list:
-        if _src(item):
-            return _src(item)
-    return ""
+    return _prefer_cdn([_src(i) for i in video_url_list if _src(i)])
 
 
 async def _resolve_vod_stream(vdvno: str) -> tuple:
